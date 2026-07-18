@@ -6,6 +6,7 @@
 #include <QSqlQuery>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
+#include <QTimeZone>
 #include <QtTest>
 #include <algorithm>
 
@@ -66,6 +67,10 @@ private slots:
         QVERIFY(app.isSensitiveMutation(QStringLiteral("PUT"), QStringLiteral("sim_cards/420.json")));
         QVERIFY(!app.isSensitiveMutation(QStringLiteral("POST"), QStringLiteral("sms")));
         QVERIFY(!app.isSensitiveMutation(QStringLiteral("GET"), QStringLiteral("calls.json")));
+        app.updateSim(QStringLiteral("420700000000"), {{QStringLiteral("roaming"), QStringLiteral("eu")}}, false);
+        QCOMPARE(app.status(), QStringLiteral("Změna SIM vyžaduje potvrzení"));
+        app.assignSim(QStringLiteral("bad"), QStringLiteral("1"), QStringLiteral("1"), false, true);
+        QCOMPARE(app.status(), QStringLiteral("Neplatné číslo, ICCID nebo PIN"));
     }
 
     void odorikHttp200Errors()
@@ -88,6 +93,19 @@ private slots:
         QCOMPARE(summary.value(QStringLiteral("price")).toDouble(), 6.0);
     }
 
+    void callFilters()
+    {
+        const QDateTime now(QDate(2026, 7, 18), QTime(12, 0), QTimeZone::UTC);
+        const QVariantMap defaults = AppController::normalizeCallFilters({{QStringLiteral("unknown"), QStringLiteral("drop")}, {QStringLiteral("page_size"), 9000}}, now);
+        QCOMPARE(defaults.value(QStringLiteral("page_size")).toInt(), 2000);
+        QCOMPARE(defaults.value(QStringLiteral("page")).toInt(), 1);
+        QCOMPARE(defaults.value(QStringLiteral("from")).toString(), QStringLiteral("2026-06-18T12:00:00Z"));
+        QVERIFY(!defaults.contains(QStringLiteral("unknown")));
+        const QVariantMap incremental = AppController::normalizeCallFilters({{QStringLiteral("since_id"), QStringLiteral("42")}}, now);
+        QVERIFY(!incremental.contains(QStringLiteral("from")));
+        QVERIFY(!incremental.contains(QStringLiteral("to")));
+    }
+
     void smsSegmentation()
     {
         AppController app;
@@ -96,6 +114,20 @@ private slots:
         QCOMPARE(app.smsInfo(QStringLiteral("€")).value(QStringLiteral("units")).toInt(), 2);
         QCOMPARE(app.smsInfo(QStringLiteral("Příliš žluťoučký")).value(QStringLiteral("encoding")).toString(), QStringLiteral("Unicode"));
         QVERIFY(!app.smsInfo(QString(766, QLatin1Char('a'))).value(QStringLiteral("valid")).toBool());
+    }
+
+    void smsTemplates()
+    {
+        AppController app;
+        app.saveSmsTemplate(QStringLiteral("Test template"), QStringLiteral("Dobrý den"));
+        const QVariantList templates = app.smsTemplates();
+        const auto found = std::ranges::find_if(templates, [](const QVariant &value) { return value.toMap().value(QStringLiteral("name")) == QLatin1String("Test template"); });
+        QVERIFY(found != templates.end());
+        const QString id = found->toMap().value(QStringLiteral("id")).toString();
+        app.deleteSmsTemplate(id);
+        QVERIFY(std::ranges::none_of(app.smsTemplates(), [](const QVariant &value) { return value.toMap().value(QStringLiteral("name")) == QLatin1String("Test template"); }));
+        app.saveSmsTemplate(QString(), QStringLiteral("x"));
+        QCOMPARE(app.status(), QStringLiteral("Template vyžaduje název a SMS do 765 znaků"));
     }
 
     void contactNormalizationAndImport()
@@ -201,6 +233,15 @@ private slots:
         QCOMPARE(tone.read(4), QByteArrayLiteral("RIFF"));
         QVERIFY(tone.size() > 88000);
         QVERIFY(app.systemDiagnostics().contains(QStringLiteral("sqlCipher")));
+    }
+
+    void bridgeIvrValidation()
+    {
+        AppController app;
+        app.saveBridgeIvr(1, QStringLiteral("shell:rm"));
+        QCOMPARE(app.status(), QStringLiteral("Neplatný IVR script nebo slot"));
+        app.saveBridgeIvr(0, QStringLiteral("answer"));
+        QCOMPARE(app.status(), QStringLiteral("Neplatný IVR script nebo slot"));
     }
 
     void portalWhitelist()

@@ -9,7 +9,7 @@ option(THSIP_WITH_WEBENGINE "Embed official Odorik portal" ON)
 option(THSIP_WITH_PJSIP "Enable PJSUA2 telephony" ON)
 option(THSIP_FETCH_PJSIP "Fetch pinned PJSIP when not installed" ON)
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Network Sql Multimedia Test)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Network Sql Multimedia Test WebSockets)
 find_package(unofficial-libphonenumber CONFIG QUIET)
 find_package(libphonenumber CONFIG QUIET)
 if(THSIP_WITH_WEBENGINE)
@@ -41,6 +41,7 @@ qt_add_qml_module(thsip
 
 target_link_libraries(thsip PRIVATE
   Qt6::Core Qt6::Gui Qt6::Quick Qt6::Network Qt6::Sql Qt6::Multimedia
+  Qt6::WebSockets
   "$<$<PLATFORM_ID:Darwin>:-framework Security>"
   "$<$<PLATFORM_ID:Darwin>:-framework Foundation>"
   "$<$<PLATFORM_ID:Darwin>:-framework Contacts>"
@@ -120,7 +121,7 @@ else()
 endif()
 target_compile_definitions(thsip_tests PRIVATE THSIP_TESTING=1 THSIP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(thsip_tests PRIVATE src)
-target_link_libraries(thsip_tests PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql Qt6::Test "$<$<PLATFORM_ID:Darwin>:-framework Security>" "$<$<PLATFORM_ID:Darwin>:-framework Foundation>" "$<$<PLATFORM_ID:Darwin>:-framework Contacts>")
+target_link_libraries(thsip_tests PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql Qt6::Test Qt6::WebSockets "$<$<PLATFORM_ID:Darwin>:-framework Security>" "$<$<PLATFORM_ID:Darwin>:-framework Foundation>" "$<$<PLATFORM_ID:Darwin>:-framework Contacts>")
 if(TARGET unofficial::libphonenumber::libphonenumber)
   target_link_libraries(thsip_tests PRIVATE unofficial::libphonenumber::libphonenumber)
   target_compile_definitions(thsip_tests PRIVATE THSIP_HAVE_LIBPHONENUMBER=1)

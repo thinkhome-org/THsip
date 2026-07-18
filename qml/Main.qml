@@ -18,8 +18,9 @@ ApplicationWindow {
         { label: "Odorik API", page: 2 }, { label: "SMS", page: 3 },
         { label: "SIM", page: 4 }, { label: "Kontakty", page: 5 },
         { label: "Routing", page: 6 }, { label: "Nahrávky", page: 7 },
-        { label: "Funkce", page: 8 }, { label: "Diagnostika", page: 9 },
-        { label: "Portál", page: 10 }, { label: "Nastavení", page: 11 }
+        { label: "Funkce", page: 8 }, { label: "Bridge", page: 9 },
+        { label: "Diagnostika", page: 10 }, { label: "Portál", page: 11 },
+        { label: "Nastavení", page: 12 }
     ]
     property string sipAccountId: ""
     property string currentCallId: ""
@@ -39,9 +40,10 @@ ApplicationWindow {
     property var diagnosticEvents: []
     property var systemDiagnosticData: ({})
 
-    function money(value) { return Number(value || 0).toLocaleString(Qt.locale("cs_CZ"), "f", 2) + " Kč" }
+    function money(value) { let number = Number(value); return isNaN(number) ? "—" : number.toLocaleString(Qt.locale("cs_CZ"), "f", 2) + " Kč" }
     function duration(value) {
-        let seconds = Number(value || 0)
+        let seconds = Number(value)
+        if (isNaN(seconds)) return "—"
         return Math.floor(seconds / 3600) + " h " + Math.floor((seconds % 3600) / 60) + " min"
     }
     function periodValue(period, key) {
@@ -108,7 +110,7 @@ ApplicationWindow {
             backend.api(apiMethod.text, apiPath.text, value)
         }
 
-        Component.onCompleted: choose(0)
+        Component.onCompleted: { choose(0); if (category === "SMS") backend.refreshSms({}) }
 
         Dialog {
             id: confirmMutation
@@ -132,7 +134,7 @@ ApplicationWindow {
                     Label { text: "SMS composer"; font.pixelSize: 20; font.bold: true }
                     RowLayout {
                         TextField { id: smsRecipient; placeholderText: "Příjemce"; Layout.fillWidth: true }
-                        TextField { id: smsSender; placeholderText: "Odesílatel (volitelné)"; Layout.fillWidth: true }
+                        ComboBox { id: smsSender; editable: true; model: backend.smsSenders; Layout.fillWidth: true; displayText: editText || currentText || "Odesílatel (volitelné)" }
                         TextField { id: smsDelayed; placeholderText: "Odložit: minuty nebo čas"; Layout.fillWidth: true }
                     }
                     TextArea { id: smsMessage; placeholderText: "Text, maximálně 765 znaků"; Layout.fillWidth: true; Layout.preferredHeight: 110; wrapMode: TextEdit.Wrap }
@@ -140,7 +142,40 @@ ApplicationWindow {
                     RowLayout {
                         Label { text: smsComposer.info.encoding + " · " + smsComposer.info.units + " jednotek · " + smsComposer.info.segments + " segmentů · zbývá " + smsComposer.info.remaining; color: smsComposer.info.valid ? palette.text : "#b00020" }
                         Item { Layout.fillWidth: true }
-                        Button { text: "Odeslat SMS"; enabled: smsComposer.info.valid && !!smsRecipient.text && !!smsMessage.text; onClicked: backend.api("POST", "sms", {recipient:smsRecipient.text, message:smsMessage.text, sender:smsSender.text, delayed:smsDelayed.text}) }
+                        Button { text: "Odeslat SMS"; enabled: smsComposer.info.valid && !!smsRecipient.text && !!smsMessage.text; onClicked: backend.api("POST", "sms", {recipient:smsRecipient.text, message:smsMessage.text, sender:smsSender.editText || smsSender.currentText, delayed:smsDelayed.text}) }
+                    }
+                    RowLayout {
+                        TextField { id: smsTemplateName; placeholderText: "Název template"; Layout.fillWidth: true }
+                        ComboBox {
+                            id: smsTemplate; model: backend.smsTemplates; textRole: "name"; valueRole: "id"; Layout.fillWidth: true
+                            onActivated: if (currentIndex >= 0) { smsTemplateName.text = backend.smsTemplates[currentIndex].name; smsMessage.text = backend.smsTemplates[currentIndex].body }
+                        }
+                        Button { text: "Uložit template"; onClicked: backend.saveSmsTemplate(smsTemplateName.text, smsMessage.text) }
+                        Button { text: "Smazat template"; enabled: smsTemplate.currentIndex >= 0; onClicked: backend.deleteSmsTemplate(smsTemplate.currentValue) }
+                    }
+                }
+            }
+            Frame {
+                visible: apiPanel.category === "SMS"
+                Layout.fillWidth: true; Layout.preferredHeight: 220
+                ColumnLayout {
+                    anchors.fill: parent
+                    RowLayout {
+                        Label { text: "SMS historie"; font.pixelSize: 18; font.bold: true }
+                        Item { Layout.fillWidth: true }
+                        Button { text: "Obnovit"; onClicked: backend.refreshSms({}) }
+                    }
+                    Label { text: "Odorik vrací jen metadata. Text viditelný pouze u SMS odeslaných z THsip."; opacity: .65 }
+                    ListView {
+                        Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: backend.smsRecords
+                        delegate: RowLayout {
+                            required property var modelData; width: ListView.view.width
+                            Label { text: modelData.date || modelData.time || modelData.occurred_at || "—"; Layout.preferredWidth: 165 }
+                            Label { text: modelData.direction || "—"; Layout.preferredWidth: 55; font.bold: true }
+                            Label { text: (modelData.source_number || modelData.sender || "—") + "  →  " + (modelData.destination_number || modelData.recipient || "—"); Layout.preferredWidth: 260; elide: Text.ElideMiddle }
+                            Label { text: modelData.message || "Text není v API"; Layout.fillWidth: true; opacity: modelData.local ? 1 : .55; elide: Text.ElideRight }
+                            Label { text: modelData.price !== undefined ? root.money(modelData.price) : "" }
+                        }
                     }
                 }
             }
@@ -405,9 +440,226 @@ ApplicationWindow {
                 }
             }
 
-            ApiPanel { panelTitle: "Kompletní Odorik REST API" }
+            Pane {
+                id: callsPage
+                property string pendingActiveId: ""
+                function value(call, keys) {
+                    for (let key of keys) if (call[key] !== undefined && call[key] !== null && call[key] !== "") return call[key]
+                    return "—"
+                }
+                function filters(page) {
+                    return {from:callsFrom.text, to:callsTo.text, direction:callsDirection.currentValue || "",
+                            status:callsStatus.currentValue || "", line:callsLine.text,
+                            phone_number_filter:callsPhone.text, page_size:200, page:page}
+                }
+                function refresh(page) { backend.refreshCalls(filters(page || 1)) }
+                Component.onCompleted: refresh(1)
+                Dialog {
+                    id: confirmActiveHangup
+                    title: "Vzdáleně ukončit aktivní hovor?"
+                    modal: true; standardButtons: Dialog.Ok | Dialog.Cancel
+                    Label { text: "Odorik active-call ID: " + callsPage.pendingActiveId; wrapMode: Text.WrapAnywhere }
+                    onAccepted: backend.hangupActiveCall(callsPage.pendingActiveId, true)
+                }
+                ColumnLayout {
+                    anchors.fill: parent
+                    RowLayout {
+                        Label { text: "Hovory"; font.pixelSize: 28; font.bold: true }
+                        Item { Layout.fillWidth: true }
+                        TabBar {
+                            id: callsTabs
+                            TabButton { text: "Historie" }
+                            TabButton { text: "Kompletní REST API" }
+                        }
+                    }
+                    StackLayout {
+                        Layout.fillWidth: true; Layout.fillHeight: true; currentIndex: callsTabs.currentIndex
+                        Pane {
+                            ColumnLayout {
+                                anchors.fill: parent
+                                RowLayout {
+                                    TextField { id: callsFrom; placeholderText: "Od (ISO datum/čas)"; Layout.fillWidth: true }
+                                    TextField { id: callsTo; placeholderText: "Do (ISO datum/čas)"; Layout.fillWidth: true }
+                                    ComboBox { id: callsDirection; model: [{label:"Všechny směry",id:""},{label:"Příchozí",id:"in"},{label:"Odchozí",id:"out"},{label:"Přesměrované",id:"redirected"}]; textRole:"label"; valueRole:"id" }
+                                    ComboBox { id: callsStatus; model: [{label:"Všechny stavy",id:""},{label:"Přijaté",id:"answered"},{label:"Zmeškané",id:"missed"}]; textRole:"label"; valueRole:"id" }
+                                }
+                                RowLayout {
+                                    TextField { id: callsLine; placeholderText: "Linka"; Layout.fillWidth: true }
+                                    TextField { id: callsPhone; placeholderText: "Telefonní číslo"; Layout.fillWidth: true }
+                                    Button { text: "Načíst"; onClicked: callsPage.refresh(1) }
+                                }
+                                Frame {
+                                    Layout.fillWidth: true; visible: backend.activeCalls.length > 0
+                                    ColumnLayout {
+                                        anchors.fill: parent
+                                        Label { text: "Aktivní hovory"; font.pixelSize: 18; font.bold: true }
+                                        Repeater {
+                                            model: backend.activeCalls
+                                            RowLayout {
+                                                required property var modelData
+                                                Layout.fillWidth: true
+                                                Label { text: callsPage.value(modelData, ["from", "source_number", "caller"]) + "  →  " + callsPage.value(modelData, ["to", "destination_number", "recipient"]); Layout.fillWidth: true }
+                                                Label { text: "ID " + callsPage.value(modelData, ["id"]); opacity: .65 }
+                                                Button { text: "Vzdáleně zavěsit"; onClicked: { callsPage.pendingActiveId = String(callsPage.value(modelData, ["id"])); confirmActiveHangup.open() } }
+                                            }
+                                        }
+                                    }
+                                }
+                                ListView {
+                                    Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 4
+                                    model: backend.calls
+                                    delegate: Frame {
+                                        id: callRow
+                                        required property var modelData
+                                        width: ListView.view.width
+                                        RowLayout {
+                                            anchors.fill: parent
+                                            Label { text: callsPage.value(callRow.modelData, ["date", "time", "start", "occurred_at"]); Layout.preferredWidth: 170 }
+                                            Label { text: callsPage.value(callRow.modelData, ["direction"]); Layout.preferredWidth: 90; font.bold: true }
+                                            Label { text: callsPage.value(callRow.modelData, ["source_number", "from"]) + "  →  " + callsPage.value(callRow.modelData, ["destination_number", "to"]); Layout.fillWidth: true; elide: Text.ElideMiddle }
+                                            Label { text: root.duration(callsPage.value(callRow.modelData, ["length", "duration"])); Layout.preferredWidth: 100 }
+                                            Label { text: root.money(callsPage.value(callRow.modelData, ["price"])); Layout.preferredWidth: 100; horizontalAlignment: Text.AlignRight }
+                                            Button { text: "Volat"; onClicked: { destination.text = String(callsPage.value(callRow.modelData, ["destination_number", "to", "source_number", "from"])); pages.currentIndex = 1 } }
+                                        }
+                                    }
+                                }
+                                RowLayout {
+                                    Button { text: "Předchozí"; enabled: backend.callPage > 1; onClicked: callsPage.refresh(backend.callPage - 1) }
+                                    Label { text: "Strana " + backend.callPage + " / " + backend.callPages }
+                                    Button { text: "Další"; enabled: backend.callPage < backend.callPages; onClicked: callsPage.refresh(backend.callPage + 1) }
+                                    Item { Layout.fillWidth: true }
+                                    Label { text: backend.calls.length + " záznamů"; opacity: .65 }
+                                }
+                            }
+                        }
+                        ApiPanel { panelTitle: "Kompletní Odorik REST API" }
+                    }
+                }
+            }
             ApiPanel { panelTitle: "SMS"; category: "SMS" }
-            ApiPanel { panelTitle: "Odorik SIM"; category: "SIM" }
+            Pane {
+                id: simPage
+                property var pendingChanges: ({})
+                function mobile() { return simMobile.text.trim() }
+                function optional(combo) { return combo.currentValue || "" }
+                function changes() {
+                    return {state:optional(simState), data_package:simDataPackage.text, data_package_for_next_month:simDataPackageNext.text,
+                        voice_package:simVoicePackage.text, voice_package_for_next_month:simVoicePackageNext.text,
+                        package_delayed_billing:simDelayedPackage.text, package_delayed_billing_for_next_month:simDelayedPackageNext.text,
+                        missed_calls_register:optional(simMissed), mobile_data:optional(simMobileData), lte:optional(simLte),
+                        lte_for_next_month:optional(simLteNext), roaming:simRoaming.text,
+                        premium_services:optional(simPremium), add_credit:simAddCredit.text}
+                }
+                Component.onCompleted: backend.refreshSimCards()
+                Dialog {
+                    id: confirmSimUpdate; title: "Potvrdit změnu SIM"; modal: true; standardButtons: Dialog.Ok | Dialog.Cancel
+                    TextArea { width: 520; readOnly: true; text: JSON.stringify(simPage.pendingChanges, null, 2); wrapMode: Text.WrapAnywhere }
+                    onAccepted: backend.updateSim(simPage.mobile(), simPage.pendingChanges, true)
+                }
+                Dialog {
+                    id: confirmSimRestart; title: "Restartovat/FUP mobilní data?"; modal: true; standardButtons: Dialog.Ok | Dialog.Cancel
+                    Label { text: "SIM " + simPage.mobile() }
+                    onAccepted: backend.restartSimData(simPage.mobile(), true)
+                }
+                Dialog {
+                    id: assignSimDialog; title: "Přiřadit fyzickou SIM?"; modal: true; standardButtons: Dialog.Ok | Dialog.Cancel
+                    ColumnLayout {
+                        width: 480
+                        Label { text: "Citlivá operace. PIN nebude uložen."; wrapMode: Text.WordWrap }
+                        TextField { id: simIccid; placeholderText: "ICCID (18–22 číslic)"; Layout.fillWidth: true }
+                        TextField { id: simPin; placeholderText: "PIN (4–8 číslic)"; echoMode: TextInput.Password; Layout.fillWidth: true }
+                        CheckBox { id: simDelayedActivation; text: "Odložená aktivace" }
+                    }
+                    onAccepted: { backend.assignSim(simPage.mobile(), simIccid.text, simPin.text, simDelayedActivation.checked, true); simPin.clear() }
+                    onRejected: simPin.clear()
+                }
+                ColumnLayout {
+                    anchors.fill: parent
+                    RowLayout {
+                        Label { text: "Odorik SIM"; font.pixelSize: 28; font.bold: true }
+                        Item { Layout.fillWidth: true }
+                        TabBar {
+                            id: simTabs
+                            TabButton { text: "Správa" }
+                            TabButton { text: "Kompletní REST API" }
+                        }
+                    }
+                    StackLayout {
+                        Layout.fillWidth: true; Layout.fillHeight: true; currentIndex: simTabs.currentIndex
+                        ScrollView {
+                            ColumnLayout {
+                                width: Math.max(720, parent.width); spacing: 10
+                                RowLayout {
+                                    ComboBox {
+                                        id: simPicker; model: backend.simCards; textRole: "phone_number"; Layout.fillWidth: true
+                                        onActivated: { let card = backend.simCards[currentIndex]; simMobile.text = String(card.phone_number || card.line || ""); backend.loadSim(simMobile.text) }
+                                    }
+                                    TextField { id: simMobile; placeholderText: "Mobilní číslo"; Layout.fillWidth: true }
+                                    Button { text: "Načíst"; onClicked: { backend.loadSim(simPage.mobile()); backend.loadSimData(simPage.mobile()) } }
+                                    Button { text: "Obnovit seznam"; onClicked: backend.refreshSimCards() }
+                                }
+                                Frame {
+                                    Layout.fillWidth: true
+                                    ColumnLayout {
+                                        anchors.fill: parent
+                                        Label { text: "Stav a probíhající změny"; font.pixelSize: 18; font.bold: true }
+                                        TextArea { Layout.fillWidth: true; Layout.preferredHeight: 110; readOnly: true; font.family: "Menlo"; text: JSON.stringify(backend.simDetail, null, 2); wrapMode: Text.WrapAnywhere }
+                                    }
+                                }
+                                Label { text: "Změna nastavení"; font.pixelSize: 18; font.bold: true }
+                                GridLayout {
+                                    Layout.fillWidth: true; columns: 4
+                                    Label { text: "Stav" }
+                                    ComboBox { id: simState; model: [{label:"Bez změny",id:""},{label:"Aktivní",id:"active"},{label:"Pozastavená",id:"suspended"}]; textRole:"label"; valueRole:"id"; Layout.fillWidth: true }
+                                    Label { text: "Dokoupit kredit/data" }
+                                    TextField { id: simAddCredit; placeholderText: "ID doplňku"; Layout.fillWidth: true }
+                                    Label { text: "Datový balíček nyní" }
+                                    TextField { id: simDataPackage; placeholderText: "ID / prázdné = bez změny"; Layout.fillWidth: true }
+                                    Label { text: "Datový balíček příští měsíc" }
+                                    TextField { id: simDataPackageNext; placeholderText: "ID"; Layout.fillWidth: true }
+                                    Label { text: "Hlasový balíček nyní" }
+                                    TextField { id: simVoicePackage; placeholderText: "ID"; Layout.fillWidth: true }
+                                    Label { text: "Hlasový balíček příští měsíc" }
+                                    TextField { id: simVoicePackageNext; placeholderText: "ID"; Layout.fillWidth: true }
+                                    Label { text: "Delayed-billing balíček" }
+                                    TextField { id: simDelayedPackage; placeholderText: "ID"; Layout.fillWidth: true }
+                                    Label { text: "Delayed-billing příští měsíc" }
+                                    TextField { id: simDelayedPackageNext; placeholderText: "ID"; Layout.fillWidth: true }
+                                    Label { text: "Mobilní data" }
+                                    ComboBox { id: simMobileData; model: [{label:"Bez změny",id:""},{label:"Zapnout",id:"true"},{label:"Vypnout",id:"false"}]; textRole:"label"; valueRole:"id"; Layout.fillWidth: true }
+                                    Label { text: "Registr zmeškaných" }
+                                    ComboBox { id: simMissed; model: [{label:"Bez změny",id:""},{label:"Zapnout",id:"true"},{label:"Vypnout",id:"false"}]; textRole:"label"; valueRole:"id"; Layout.fillWidth: true }
+                                    Label { text: "LTE nyní" }
+                                    ComboBox { id: simLte; model: [{label:"Bez změny",id:""},{label:"Zapnout",id:"true"},{label:"Vypnout",id:"false"}]; textRole:"label"; valueRole:"id"; Layout.fillWidth: true }
+                                    Label { text: "LTE příští měsíc" }
+                                    ComboBox { id: simLteNext; model: [{label:"Bez změny",id:""},{label:"Zapnout",id:"true"},{label:"Vypnout",id:"false"}]; textRole:"label"; valueRole:"id"; Layout.fillWidth: true }
+                                    Label { text: "Roaming profil" }
+                                    TextField { id: simRoaming; placeholderText: "ID profilu"; Layout.fillWidth: true }
+                                    Label { text: "Premium služby" }
+                                    ComboBox { id: simPremium; model: [{label:"Bez změny",id:""},{label:"Vypnout",id:"off"},{label:"SMS platby + DMS",id:"sms_payments_and_dms"},{label:"Vše kromě SMS plateb",id:"all_other_than_sms_payments_and_dms"},{label:"Vše",id:"all"}]; textRole:"label"; valueRole:"id"; Layout.fillWidth: true }
+                                }
+                                Label { visible: simState.currentValue; text: "Při změně stavu Odorik ignoruje ostatní parametry; THsip odešle jen stav."; color: "#b26a00" }
+                                RowLayout {
+                                    Button { text: "Zkontrolovat a změnit"; onClicked: { simPage.pendingChanges = simPage.changes(); confirmSimUpdate.open() } }
+                                    Button { text: "Restart/FUP dat"; onClicked: confirmSimRestart.open() }
+                                    Button { text: "Přiřadit fyzickou SIM"; onClicked: assignSimDialog.open() }
+                                }
+                                Label { text: "Historie mobilních dat"; font.pixelSize: 18; font.bold: true }
+                                ListView {
+                                    Layout.fillWidth: true; Layout.preferredHeight: Math.min(200, contentHeight); model: backend.simData; clip: true
+                                    delegate: RowLayout {
+                                        required property var modelData; width: ListView.view.width
+                                        Label { text: modelData.date || modelData.time || "—"; Layout.preferredWidth: 170 }
+                                        Label { text: "↓ " + (modelData.download || modelData.bytes_down || 0) + " · ↑ " + (modelData.upload || modelData.bytes_up || 0); Layout.fillWidth: true }
+                                        Label { text: modelData.price !== undefined ? root.money(modelData.price) : "" }
+                                    }
+                                }
+                            }
+                        }
+                        ApiPanel { panelTitle: "Kompletní SIM REST API"; category: "SIM" }
+                    }
+                }
+            }
 
             Pane {
                 ColumnLayout {
@@ -680,6 +932,68 @@ ApplicationWindow {
                             contentItem: Column {
                                 Label { text: modelData.title; font.bold: true }
                                 Label { text: modelData.category + " · " + modelData.mechanism + " · " + modelData.status; opacity: .7 }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Pane {
+                id: bridgePage
+                Component.onCompleted: backend.refreshBridgeEvents()
+                ColumnLayout {
+                    anchors.fill: parent
+                    RowLayout {
+                        Label { text: "THsip Bridge"; font.pixelSize: 28; font.bold: true }
+                        Label { text: backend.bridgeLive ? "WebSocket živý" : "Odpojen"; color: backend.bridgeLive ? "#2e7d32" : "#b26a00" }
+                        Item { Layout.fillWidth: true }
+                        Button { text: "Obnovit události"; onClicked: backend.refreshBridgeEvents() }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.fillHeight: true; Layout.alignment: Qt.AlignTop
+                        Frame {
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            ColumnLayout {
+                                anchors.fill: parent
+                                Label { text: "Remote IVR builder"; font.pixelSize: 20; font.bold: true }
+                                RowLayout {
+                                    Label { text: "Slot" }
+                                    SpinBox { id: bridgeIvrSlot; from: 1; to: 99; value: 1; editable: true }
+                                    Button { text: "Načíst"; onClicked: backend.loadBridgeIvr(bridgeIvrSlot.value) }
+                                    Button { text: "Uložit"; onClicked: backend.saveBridgeIvr(bridgeIvrSlot.value, bridgeIvrScript.text) }
+                                }
+                                TextArea {
+                                    id: bridgeIvrScript
+                                    Layout.fillWidth: true; Layout.fillHeight: true; font.family: "Menlo"
+                                    text: backend.ivrScript
+                                    placeholderText: "answer\nplay:1\ndial:*08320+420123456789"
+                                    wrapMode: TextEdit.NoWrap
+                                }
+                                Label { text: "Povolené: answer, play, play2, playnumber, dial, setclip, hangup, uri. Max 100 příkazů."; wrapMode: Text.WordWrap; Layout.fillWidth: true; opacity: .65 }
+                            }
+                        }
+                        Frame {
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            ColumnLayout {
+                                anchors.fill: parent
+                                Label { text: "Webhooky 98/99"; font.pixelSize: 20; font.bold: true }
+                                ListView {
+                                    Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 4; model: backend.bridgeEvents
+                                    delegate: Frame {
+                                        id: bridgeEventRow
+                                        required property var modelData
+                                        width: ListView.view.width
+                                        ColumnLayout {
+                                            anchors.fill: parent
+                                            RowLayout {
+                                                Label { text: "Webhook " + bridgeEventRow.modelData.kind; font.bold: true }
+                                                Label { text: bridgeEventRow.modelData.occurredAt || "—"; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; opacity: .65 }
+                                            }
+                                            Label { text: (bridgeEventRow.modelData.from || "—") + "  →  " + (bridgeEventRow.modelData.to || "—") + " · linka " + (bridgeEventRow.modelData.line || "—"); Layout.fillWidth: true; elide: Text.ElideMiddle }
+                                            Label { text: "Call-ID " + (bridgeEventRow.modelData.callId || "—") + " · " + (bridgeEventRow.modelData.status || ""); Layout.fillWidth: true; elide: Text.ElideMiddle; opacity: .65 }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

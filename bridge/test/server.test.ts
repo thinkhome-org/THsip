@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Readable } from "node:stream";
+import WebSocket from "ws";
 import { createApp, validateIvr, type EventInput, type Objects, type Recording, type Store } from "../src/server.js";
 
 class MemoryStore implements Store {
@@ -82,5 +83,23 @@ test("recording accepts fields after file and safely retries", async () => {
   assert.equal(store.recordingList[0]?.callId, "call-42");
   assert.equal(store.recordingList[0]?.size, 4);
   assert.equal(objects.values.size, 1);
+  await app.close();
+});
+
+test("websocket streams new webhook events", async () => {
+  const app = await createApp({ store:new MemoryStore(), objects:new MemoryObjects(), ingressToken:"ingress-secret", clientToken:"client-secret" });
+  await app.listen({ host:"127.0.0.1", port:0 });
+  const address = app.server.address();
+  assert(address && typeof address !== "string");
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/stream`, { headers:{authorization:"Bearer client-secret"} });
+  await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  const message = new Promise<Record<string,unknown>>((resolve, reject) => {
+    socket.once("message", data => { try { resolve(JSON.parse(data.toString())); } catch (error) { reject(error); } });
+  });
+  await fetch(`http://127.0.0.1:${address.port}/odorik/hooks/99?token=ingress-secret&sip_in_callid=live-1&time=2026-07-18T12%3A00%3A00Z`);
+  const payload = await message;
+  assert.equal(payload.type, "event");
+  assert.equal((payload.event as EventInput).callId, "live-1");
+  socket.close();
   await app.close();
 });

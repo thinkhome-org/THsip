@@ -3,10 +3,12 @@
 #include <QAbstractListModel>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QDateTime>
 #include <QNetworkAccessManager>
 #include <QObject>
 #include <QSqlDatabase>
 #include <QUrl>
+#include <QWebSocket>
 #include <functional>
 
 struct DialModifier {
@@ -45,6 +47,19 @@ class AppController final : public QObject {
     Q_PROPERTY(QUrl recordingPlaybackUrl READ recordingPlaybackUrl NOTIFY recordingPlaybackUrlChanged)
     Q_PROPERTY(QVariantList networkDiagnostics READ networkDiagnostics NOTIFY networkDiagnosticsChanged)
     Q_PROPERTY(QVariantMap dashboard READ dashboard NOTIFY dashboardChanged)
+    Q_PROPERTY(QVariantList calls READ calls NOTIFY callsChanged)
+    Q_PROPERTY(QVariantList activeCalls READ activeCalls NOTIFY callsChanged)
+    Q_PROPERTY(int callPage READ callPage NOTIFY callsChanged)
+    Q_PROPERTY(int callPages READ callPages NOTIFY callsChanged)
+    Q_PROPERTY(QVariantList smsRecords READ smsRecords NOTIFY smsChanged)
+    Q_PROPERTY(QStringList smsSenders READ smsSenders NOTIFY smsChanged)
+    Q_PROPERTY(QVariantList smsTemplates READ smsTemplates NOTIFY smsChanged)
+    Q_PROPERTY(QVariantList simCards READ simCards NOTIFY simChanged)
+    Q_PROPERTY(QVariantMap simDetail READ simDetail NOTIFY simChanged)
+    Q_PROPERTY(QVariantList simData READ simData NOTIFY simChanged)
+    Q_PROPERTY(QVariantList bridgeEvents READ bridgeEvents NOTIFY bridgeChanged)
+    Q_PROPERTY(QString ivrScript READ ivrScript NOTIFY bridgeChanged)
+    Q_PROPERTY(bool bridgeLive READ bridgeLive NOTIFY bridgeChanged)
     Q_PROPERTY(bool webEngineAvailable READ webEngineAvailable CONSTANT)
     Q_PROPERTY(bool pjsipAvailable READ pjsipAvailable CONSTANT)
 
@@ -66,6 +81,19 @@ public:
     QUrl recordingPlaybackUrl() const { return recordingPlaybackUrl_; }
     QVariantList networkDiagnostics() const { return networkDiagnostics_; }
     QVariantMap dashboard() const { return dashboard_; }
+    QVariantList calls() const { return calls_; }
+    QVariantList activeCalls() const { return activeCalls_; }
+    int callPage() const { return callPage_; }
+    int callPages() const { return callPages_; }
+    QVariantList smsRecords() const { return smsRecords_; }
+    QStringList smsSenders() const { return smsSenders_; }
+    QVariantList smsTemplates() const { return smsTemplates_; }
+    QVariantList simCards() const { return simCards_; }
+    QVariantMap simDetail() const { return simDetail_; }
+    QVariantList simData() const { return simData_; }
+    QVariantList bridgeEvents() const { return bridgeEvents_; }
+    QString ivrScript() const { return ivrScript_; }
+    bool bridgeLive() const { return bridgeSocket_.state() == QAbstractSocket::ConnectedState; }
     bool webEngineAvailable() const;
     bool pjsipAvailable() const;
 
@@ -81,6 +109,21 @@ public:
     Q_INVOKABLE void refreshContacts();
     Q_INVOKABLE void refreshBalance();
     Q_INVOKABLE void refreshDashboard();
+    Q_INVOKABLE void refreshCalls(const QVariantMap &filters = {});
+    Q_INVOKABLE void hangupActiveCall(const QString &id, bool confirmed);
+    Q_INVOKABLE void refreshSms(const QVariantMap &filters = {});
+    Q_INVOKABLE void saveSmsTemplate(const QString &name, const QString &body);
+    Q_INVOKABLE void deleteSmsTemplate(const QString &id);
+    Q_INVOKABLE void refreshSimCards();
+    Q_INVOKABLE void loadSim(const QString &mobile);
+    Q_INVOKABLE void loadSimData(const QString &mobile, const QString &from = {}, const QString &to = {});
+    Q_INVOKABLE void updateSim(const QString &mobile, const QVariantMap &changes, bool confirmed);
+    Q_INVOKABLE void restartSimData(const QString &mobile, bool confirmed);
+    Q_INVOKABLE void assignSim(const QString &mobile, const QString &iccid, const QString &pin, bool delayed, bool confirmed);
+    Q_INVOKABLE void refreshBridgeEvents();
+    Q_INVOKABLE void loadBridgeIvr(int slot);
+    Q_INVOKABLE void saveBridgeIvr(int slot, const QString &script);
+    static QVariantMap normalizeCallFilters(const QVariantMap &filters, QDateTime now = QDateTime::currentDateTime());
     static QVariantMap summarizeStatistics(const QJsonObject &statistics);
     Q_INVOKABLE QString compileDial(const QString &destination, const QVariantList &modifiers) const;
     Q_INVOKABLE QString compileDialAction(const QString &id, const QVariantMap &parameters, bool advancedEnabled) const;
@@ -118,6 +161,10 @@ signals:
     void recordingPlaybackUrlChanged();
     void networkDiagnosticsChanged();
     void dashboardChanged();
+    void callsChanged();
+    void smsChanged();
+    void simChanged();
+    void bridgeChanged();
 
 private:
     void setStatus(QString value);
@@ -130,6 +177,9 @@ private:
     void getJson(const QString &path, const QVariantMap &parameters, std::function<void(QJsonDocument)> callback,
                  std::function<void()> failure = {});
     void finishDashboardRequest(quint64 generation);
+    void loadSmsTemplates();
+    void persistSmsTemplates();
+    void connectBridgeStream();
     bool knownRoutingNumber(const QString &number) const;
     void loadRecordings();
     void fetchRecording(const QString &id, std::function<void(QByteArray, QString)> callback);
@@ -151,6 +201,20 @@ private:
     QVariantMap dashboard_;
     quint64 dashboardGeneration_ = 0;
     int dashboardPending_ = 0;
+    QVariantList calls_;
+    QVariantList activeCalls_;
+    QVariantMap callFilters_;
+    int callPage_ = 1;
+    int callPages_ = 1;
+    QVariantList smsRecords_;
+    QStringList smsSenders_;
+    QVariantList smsTemplates_;
+    QVariantList simCards_;
+    QVariantMap simDetail_;
+    QVariantList simData_;
+    QVariantList bridgeEvents_;
+    QString ivrScript_;
+    QWebSocket bridgeSocket_;
     QSqlDatabase database_;
     QString user_;
     QString password_;

@@ -59,6 +59,20 @@ QString required(const QVariantMap &p, const char *key)
 
 QString pathSegment(const QString &value) { return QString::fromLatin1(QUrl::toPercentEncoding(value)); }
 
+bool validSimMobile(const QString &value)
+{
+    return QRegularExpression(QStringLiteral("^\\+?[0-9]{6,16}$")).match(value.trimmed()).hasMatch();
+}
+
+QString firstJsonString(const QJsonObject &object, std::initializer_list<const char *> keys)
+{
+    for (const char *key : keys) {
+        const QJsonValue value = object.value(QLatin1String(key));
+        if (!value.isUndefined() && !value.isNull()) return value.toVariant().toString();
+    }
+    return {};
+}
+
 QString routingCanonical(QString value)
 {
     value = value.trimmed();
@@ -233,6 +247,18 @@ QStringList CapabilityCatalog::invalidItems() const
 
 AppController::AppController(QObject *parent) : QObject(parent)
 {
+    connect(&bridgeSocket_, &QWebSocket::connected, this, [this] { emit bridgeChanged(); refreshBridgeEvents(); });
+    connect(&bridgeSocket_, &QWebSocket::disconnected, this, [this] {
+        emit bridgeChanged();
+        QTimer::singleShot(5000, this, [this] { if (bridgeSocket_.state() == QAbstractSocket::UnconnectedState) connectBridgeStream(); });
+    });
+    connect(&bridgeSocket_, &QWebSocket::textMessageReceived, this, [this](const QString &message) {
+        const QJsonObject payload = QJsonDocument::fromJson(message.toUtf8()).object();
+        if (payload.value(QStringLiteral("type")).toString() != QLatin1String("event")) return;
+        bridgeEvents_.prepend(payload.value(QStringLiteral("event")).toObject().toVariantMap());
+        if (bridgeEvents_.size() > 1000) bridgeEvents_.resize(1000);
+        emit bridgeChanged();
+    });
     QFile file(QStringLiteral(":/qt/qml/THsip/resources/capabilities.json"));
     bool opened = file.open(QIODevice::ReadOnly);
     if (!opened) {
@@ -256,12 +282,14 @@ AppController::AppController(QObject *parent) : QObject(parent)
     else setStatus(QStringLiteral("Dial-action katalog nelze načíst"));
     initializeDatabase();
     refreshContacts();
+    loadSmsTemplates();
     QSettings settings;
     user_ = settings.value(QStringLiteral("account/user")).toString();
     if (!user_.isEmpty()) password_ = SecretStore::load(QStringLiteral("odorik-api/") + user_);
     bridgeBaseUrl_ = settings.value(QStringLiteral("bridge/baseUrl")).toUrl();
     if (bridgeBaseUrl_.isValid()) bridgeToken_ = SecretStore::load(QStringLiteral("bridge-client-token"));
     loadRecordings();
+    if (!bridgeToken_.isEmpty()) connectBridgeStream();
     if (!password_.isEmpty()) QTimer::singleShot(0, this, &AppController::refreshDashboard);
 }
 
@@ -603,6 +631,242 @@ void AppController::refreshDashboard()
     }, [this, generation] { finishDashboardRequest(generation); });
 }
 
+QVariantMap AppController::normalizeCallFilters(const QVariantMap &filters, QDateTime now)
+{
+    static const QSet<QString> allowed{QStringLiteral("from"), QStringLiteral("to"), QStringLiteral("since_id"),
+        QStringLiteral("direction"), QStringLiteral("line"), QStringLiteral("min_length"), QStringLiteral("max_length"),
+        QStringLiteral("min_price"), QStringLiteral("max_price"), QStringLiteral("status"), QStringLiteral("phone_number_filter"),
+        QStringLiteral("page_size"), QStringLiteral("page"), QStringLiteral("sip_ids"), QStringLiteral("include_sms")};
+    QVariantMap query;
+    for (auto it = filters.cbegin(); it != filters.cend(); ++it)
+        if (allowed.contains(it.key()) && !it.value().toString().trimmed().isEmpty()) query.insert(it.key(), it.value());
+    if (!query.contains(QStringLiteral("since_id"))) {
+        if (!query.contains(QStringLiteral("from"))) query[QStringLiteral("from")] = now.addDays(-30).toString(Qt::ISODate);
+        if (!query.contains(QStringLiteral("to"))) query[QStringLiteral("to")] = now.toString(Qt::ISODate);
+    }
+    query[QStringLiteral("page_size")] = std::clamp(query.value(QStringLiteral("page_size"), 200).toInt(), 1, 2000);
+    query[QStringLiteral("page")] = std::max(1, query.value(QStringLiteral("page"), 1).toInt());
+    query[QStringLiteral("sip_ids")] = true;
+    query[QStringLiteral("include_sms")] = true;
+    return query;
+}
+
+void AppController::refreshCalls(const QVariantMap &filters)
+{
+    if (user_.isEmpty() || password_.isEmpty()) { setStatus(QStringLiteral("Nejdřív nastav účet")); return; }
+    const QVariantMap query = normalizeCallFilters(filters);
+    callFilters_ = query;
+    setStatus(QStringLiteral("Načítám historii hovorů"));
+
+    QNetworkReply *reply = network_.get(QNetworkRequest(endpoint(QStringLiteral("calls.json"), query)));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, query] {
+        const QByteArray body = reply->readAll();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString error = odorikError(body);
+        const QJsonDocument json = QJsonDocument::fromJson(body);
+        if (reply->error() != QNetworkReply::NoError || status >= 400 || !error.isEmpty() || !json.isArray()) {
+            setStatus(QStringLiteral("Historii nelze načíst: %1").arg(error.isEmpty() ? QString::number(status) : error));
+        } else {
+            calls_ = json.array().toVariantList();
+            callPage_ = query.value(QStringLiteral("page")).toInt();
+            callPages_ = std::max(1, reply->rawHeader("Odorik-Pages").toInt());
+            emit callsChanged();
+            if (database_.transaction()) {
+                QSqlQuery save(database_);
+                save.prepare(QStringLiteral("INSERT INTO calls(id,occurred_at,direction,status,from_number,to_number,line,price,payload) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET occurred_at=excluded.occurred_at,direction=excluded.direction,status=excluded.status,from_number=excluded.from_number,to_number=excluded.to_number,line=excluded.line,price=excluded.price,payload=excluded.payload"));
+                bool ok = true;
+                for (const QJsonValue &value : json.array()) {
+                    const QJsonObject call = value.toObject();
+                    const QString id = firstJsonString(call, {"id"});
+                    const QString occurred = firstJsonString(call, {"date", "time", "start", "occurred_at"});
+                    if (id.isEmpty() || occurred.isEmpty()) continue;
+                    save.bindValue(0, id); save.bindValue(1, occurred);
+                    save.bindValue(2, firstJsonString(call, {"direction"})); save.bindValue(3, firstJsonString(call, {"status"}));
+                    save.bindValue(4, firstJsonString(call, {"source_number", "from"})); save.bindValue(5, firstJsonString(call, {"destination_number", "to"}));
+                    save.bindValue(6, firstJsonString(call, {"line"})); save.bindValue(7, firstJsonString(call, {"price"}));
+                    save.bindValue(8, QString::fromUtf8(QJsonDocument(call).toJson(QJsonDocument::Compact)));
+                    if (!save.exec()) { ok = false; break; }
+                    save.finish();
+                }
+                ok ? database_.commit() : database_.rollback();
+            }
+            setStatus(QStringLiteral("Historie načtena · strana %1/%2").arg(callPage_).arg(callPages_));
+        }
+        reply->deleteLater();
+    });
+    getJson(QStringLiteral("active_calls.json"), {}, [this](const QJsonDocument &json) {
+        activeCalls_ = json.array().toVariantList();
+        emit callsChanged();
+    });
+}
+
+void AppController::hangupActiveCall(const QString &id, bool confirmed)
+{
+    const QString clean = id.trimmed();
+    if (!confirmed) { setStatus(QStringLiteral("Vzdálené zavěšení vyžaduje potvrzení")); return; }
+    if (user_.isEmpty() || password_.isEmpty() || !QRegularExpression(QStringLiteral("^[A-Za-z0-9._:-]{1,128}$")).match(clean).hasMatch()) {
+        setStatus(QStringLiteral("Neplatné ID aktivního hovoru")); return;
+    }
+    QNetworkReply *reply = network_.deleteResource(QNetworkRequest(endpoint(QStringLiteral("active_calls/%1.json").arg(pathSegment(clean)), {})));
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        const QByteArray body = reply->readAll();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString error = odorikError(body);
+        if (reply->error() != QNetworkReply::NoError || status >= 400 || !error.isEmpty())
+            setStatus(QStringLiteral("Hovor nelze vzdáleně ukončit: %1").arg(error.isEmpty() ? QString::number(status) : error));
+        else { setStatus(QStringLiteral("Hovor vzdáleně ukončen")); refreshCalls(callFilters_); }
+        reply->deleteLater();
+    });
+}
+
+void AppController::refreshSms(const QVariantMap &filters)
+{
+    if (user_.isEmpty() || password_.isEmpty()) { setStatus(QStringLiteral("Nejdřív nastav účet")); return; }
+    QVariantMap query;
+    for (const QString &key : {QStringLiteral("from"), QStringLiteral("to"), QStringLiteral("direction"), QStringLiteral("line")}) {
+        const QString value = filters.value(key).toString().trimmed();
+        if (!value.isEmpty()) query[key] = value;
+    }
+    if (!query.contains(QStringLiteral("from"))) query[QStringLiteral("from")] = QDateTime::currentDateTime().addDays(-30).toString(Qt::ISODate);
+    if (!query.contains(QStringLiteral("to"))) query[QStringLiteral("to")] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    getJson(QStringLiteral("sms.json"), query, [this](const QJsonDocument &json) {
+        QVariantList records;
+        for (const QJsonValue &value : json.array()) {
+            QVariantMap item = value.toObject().toVariantMap();
+            item[QStringLiteral("local")] = false;
+            records << item;
+        }
+        QSqlQuery local(database_);
+        if (local.exec(QStringLiteral("SELECT id,occurred_at,direction,sender,recipient,local_body FROM sms_records WHERE local_body IS NOT NULL ORDER BY occurred_at DESC LIMIT 500"))) {
+            while (local.next()) records.prepend(QVariantMap{{QStringLiteral("id"), local.value(0)}, {QStringLiteral("date"), local.value(1)},
+                {QStringLiteral("direction"), local.value(2)}, {QStringLiteral("source_number"), local.value(3)},
+                {QStringLiteral("destination_number"), local.value(4)}, {QStringLiteral("message"), local.value(5)}, {QStringLiteral("local"), true}});
+        }
+        smsRecords_ = std::move(records);
+        emit smsChanged();
+    });
+
+    QNetworkReply *reply = network_.get(QNetworkRequest(endpoint(QStringLiteral("sms/allowed_sender"), {})));
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        const QByteArray body = reply->readAll();
+        const QJsonDocument json = QJsonDocument::fromJson(body);
+        QStringList senders;
+        if (json.isArray()) for (const QJsonValue &value : json.array()) senders << value.toString();
+        else senders = QString::fromUtf8(body).split(QRegularExpression(QStringLiteral("[,;\\r\\n]+")), Qt::SkipEmptyParts);
+        for (QString &sender : senders) sender = sender.trimmed();
+        senders.removeAll(QString());
+        senders.removeDuplicates();
+        if (reply->error() == QNetworkReply::NoError && odorikError(body).isEmpty()) { smsSenders_ = senders; emit smsChanged(); }
+        reply->deleteLater();
+    });
+}
+
+void AppController::loadSmsTemplates()
+{
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral("SELECT value FROM settings WHERE key='sms/templates'"));
+    if (query.exec() && query.next()) smsTemplates_ = QJsonDocument::fromJson(query.value(0).toByteArray()).array().toVariantList();
+}
+
+void AppController::persistSmsTemplates()
+{
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral("INSERT INTO settings(key,value) VALUES('sms/templates',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP"));
+    query.addBindValue(QString::fromUtf8(QJsonDocument::fromVariant(smsTemplates_).toJson(QJsonDocument::Compact)));
+    if (!query.exec()) setStatus(QStringLiteral("SMS templates nelze uložit"));
+}
+
+void AppController::saveSmsTemplate(const QString &name, const QString &body)
+{
+    const QString cleanName = name.trimmed();
+    if (cleanName.isEmpty() || cleanName.size() > 80 || body.isEmpty() || body.size() > 765) { setStatus(QStringLiteral("Template vyžaduje název a SMS do 765 znaků")); return; }
+    const QString id = QString::fromLatin1(QCryptographicHash::hash(cleanName.toUtf8(), QCryptographicHash::Sha256).toHex());
+    const QVariantMap item{{QStringLiteral("id"), id}, {QStringLiteral("name"), cleanName}, {QStringLiteral("body"), body}};
+    bool replaced = false;
+    for (qsizetype i = 0; i < smsTemplates_.size(); ++i)
+        if (smsTemplates_.at(i).toMap().value(QStringLiteral("id")).toString() == id) { smsTemplates_[i] = item; replaced = true; break; }
+    if (!replaced) smsTemplates_ << item;
+    persistSmsTemplates(); emit smsChanged(); setStatus(QStringLiteral("SMS template uložen"));
+}
+
+void AppController::deleteSmsTemplate(const QString &id)
+{
+    const qsizetype before = smsTemplates_.size();
+    smsTemplates_.removeIf([&id](const QVariant &value) { return value.toMap().value(QStringLiteral("id")).toString() == id; });
+    if (smsTemplates_.size() == before) { setStatus(QStringLiteral("SMS template nenalezen")); return; }
+    persistSmsTemplates(); emit smsChanged(); setStatus(QStringLiteral("SMS template smazán"));
+}
+
+void AppController::refreshSimCards()
+{
+    const QVariantMap query{{QStringLiteral("include_available_data_packages"), true}, {QStringLiteral("include_available_credit_addons"), true},
+        {QStringLiteral("include_available_packages_delayed_billing"), true}, {QStringLiteral("include_available_roaming_settings"), true}};
+    getJson(QStringLiteral("sim_cards.json"), query, [this](const QJsonDocument &json) {
+        simCards_ = json.array().toVariantList();
+        emit simChanged();
+        setStatus(QStringLiteral("SIM načteny"));
+    });
+}
+
+void AppController::loadSim(const QString &mobile)
+{
+    const QString clean = mobile.trimmed();
+    if (!validSimMobile(clean)) { setStatus(QStringLiteral("Neplatné mobilní číslo SIM")); return; }
+    const QVariantMap query{{QStringLiteral("include_available_data_packages"), true}, {QStringLiteral("include_available_credit_addons"), true},
+        {QStringLiteral("include_available_packages_delayed_billing"), true}, {QStringLiteral("include_available_roaming_settings"), true}};
+    getJson(QStringLiteral("sim_cards/%1.json").arg(pathSegment(clean)), query, [this](const QJsonDocument &json) {
+        simDetail_ = json.object().toVariantMap(); emit simChanged(); setStatus(QStringLiteral("SIM detail načten"));
+    });
+}
+
+void AppController::loadSimData(const QString &mobile, const QString &from, const QString &to)
+{
+    const QString clean = mobile.trimmed();
+    if (!validSimMobile(clean)) { setStatus(QStringLiteral("Neplatné mobilní číslo SIM")); return; }
+    const QVariantMap query{{QStringLiteral("from"), from.trimmed().isEmpty() ? QDateTime::currentDateTime().addDays(-30).toString(Qt::ISODate) : from.trimmed()},
+        {QStringLiteral("to"), to.trimmed().isEmpty() ? QDateTime::currentDateTime().toString(Qt::ISODate) : to.trimmed()}};
+    getJson(QStringLiteral("sim_cards/%1/mobile_data.json").arg(pathSegment(clean)), query, [this](const QJsonDocument &json) {
+        simData_ = json.array().toVariantList(); emit simChanged(); setStatus(QStringLiteral("Historie SIM dat načtena"));
+    });
+}
+
+void AppController::updateSim(const QString &mobile, const QVariantMap &changes, bool confirmed)
+{
+    const QString clean = mobile.trimmed();
+    if (!confirmed) { setStatus(QStringLiteral("Změna SIM vyžaduje potvrzení")); return; }
+    if (!validSimMobile(clean)) { setStatus(QStringLiteral("Neplatné mobilní číslo SIM")); return; }
+    static const QSet<QString> allowed{QStringLiteral("state"), QStringLiteral("data_package"), QStringLiteral("data_package_for_next_month"),
+        QStringLiteral("voice_package"), QStringLiteral("voice_package_for_next_month"), QStringLiteral("package_delayed_billing"),
+        QStringLiteral("package_delayed_billing_for_next_month"), QStringLiteral("missed_calls_register"), QStringLiteral("mobile_data"),
+        QStringLiteral("lte"), QStringLiteral("lte_for_next_month"), QStringLiteral("roaming"), QStringLiteral("premium_services"), QStringLiteral("add_credit")};
+    QVariantMap parameters;
+    for (auto it = changes.cbegin(); it != changes.cend(); ++it)
+        if (allowed.contains(it.key()) && !it.value().toString().trimmed().isEmpty()) parameters[it.key()] = it.value();
+    const QString state = parameters.value(QStringLiteral("state")).toString();
+    if (!state.isEmpty() && state != QLatin1String("active") && state != QLatin1String("suspended")) { setStatus(QStringLiteral("Neplatný stav SIM")); return; }
+    if (!state.isEmpty()) parameters = {{QStringLiteral("state"), state}};
+    if (parameters.isEmpty()) { setStatus(QStringLiteral("Není vybraná žádná změna SIM")); return; }
+    parameters[QStringLiteral("_confirmed")] = true;
+    api(QStringLiteral("PUT"), QStringLiteral("sim_cards/%1.json").arg(pathSegment(clean)), parameters);
+}
+
+void AppController::restartSimData(const QString &mobile, bool confirmed)
+{
+    const QString clean = mobile.trimmed();
+    if (!confirmed || !validSimMobile(clean)) { setStatus(confirmed ? QStringLiteral("Neplatné mobilní číslo SIM") : QStringLiteral("Restart dat vyžaduje potvrzení")); return; }
+    api(QStringLiteral("POST"), QStringLiteral("sim_cards/%1/data_restart").arg(pathSegment(clean)), {{QStringLiteral("_confirmed"), true}});
+}
+
+void AppController::assignSim(const QString &mobile, const QString &iccid, const QString &pin, bool delayed, bool confirmed)
+{
+    const QString clean = mobile.trimmed();
+    if (!confirmed) { setStatus(QStringLiteral("Přiřazení SIM vyžaduje potvrzení")); return; }
+    if (!validSimMobile(clean) || !QRegularExpression(QStringLiteral("^[0-9]{18,22}$")).match(iccid.trimmed()).hasMatch() ||
+        !QRegularExpression(QStringLiteral("^[0-9]{4,8}$")).match(pin.trimmed()).hasMatch()) { setStatus(QStringLiteral("Neplatné číslo, ICCID nebo PIN")); return; }
+    api(QStringLiteral("POST"), QStringLiteral("sim_cards/%1/assign_number_to_sim.json").arg(pathSegment(clean)),
+        {{QStringLiteral("iccid"), iccid.trimmed()}, {QStringLiteral("pin"), pin.trimmed()}, {QStringLiteral("delayed_activation"), delayed}, {QStringLiteral("_confirmed"), true}});
+}
+
 void AppController::handleReply(QNetworkReply *reply, const QString &path, const QVariantMap &parameters, bool mutation)
 {
     const QByteArray data = reply->readAll();
@@ -635,10 +899,16 @@ void AppController::handleReply(QNetworkReply *reply, const QString &path, const
             insert.addBindValue(parameters.value(QStringLiteral("recipient")));
             insert.addBindValue(parameters.value(QStringLiteral("message")));
             if (!insert.exec()) setStatus(QStringLiteral("SMS odeslána, lokální historii nelze uložit"));
+            else refreshSms({});
         }
         if (mutation && path.startsWith(QLatin1String("public_numbers/"))) {
             const QString encoded = path.section(QLatin1Char('/'), 1, 1);
             loadRouting(QUrl::fromPercentEncoding(encoded.toUtf8()));
+        }
+        if (mutation && path.startsWith(QLatin1String("sim_cards/"))) {
+            const QString mobile = QUrl::fromPercentEncoding(path.section(QLatin1Char('/'), 1, 1).toUtf8()).remove(QStringLiteral(".json"));
+            refreshSimCards();
+            if (validSimMobile(mobile)) loadSim(mobile);
         }
     }
     reply->deleteLater();
@@ -847,6 +1117,61 @@ void AppController::configureBridge(const QUrl &baseUrl, const QString &token)
     QSettings().setValue(QStringLiteral("bridge/baseUrl"), bridgeBaseUrl_);
     setStatus(SecretStore::save(QStringLiteral("bridge-client-token"), token) ? QStringLiteral("Bridge uložen v Keychainu") : QStringLiteral("Bridge token nelze uložit"));
     refreshRecordings();
+    connectBridgeStream();
+}
+
+void AppController::connectBridgeStream()
+{
+    if (!bridgeBaseUrl_.isValid() || bridgeToken_.isEmpty()) return;
+    bridgeSocket_.abort();
+    QNetworkRequest request = bridgeRequest(QStringLiteral("v1/stream"));
+    QUrl url = request.url();
+    url.setScheme(url.scheme() == QLatin1String("https") ? QStringLiteral("wss") : QStringLiteral("ws"));
+    request.setUrl(url);
+    bridgeSocket_.open(request);
+}
+
+void AppController::refreshBridgeEvents()
+{
+    if (!bridgeBaseUrl_.isValid() || bridgeToken_.isEmpty()) { setStatus(QStringLiteral("Bridge není nastaven")); return; }
+    QNetworkReply *reply = network_.get(bridgeRequest(QStringLiteral("v1/events?limit=1000")));
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        const QJsonDocument json = QJsonDocument::fromJson(reply->readAll());
+        if (reply->error() != QNetworkReply::NoError || !json.isArray()) setStatus(QStringLiteral("Bridge události nelze načíst"));
+        else { bridgeEvents_ = json.array().toVariantList(); emit bridgeChanged(); setStatus(QStringLiteral("Bridge události načteny")); }
+        reply->deleteLater();
+    });
+}
+
+void AppController::loadBridgeIvr(int slot)
+{
+    if (slot < 1 || slot > 99 || !bridgeBaseUrl_.isValid() || bridgeToken_.isEmpty()) { setStatus(QStringLiteral("IVR slot musí být 1–99 a Bridge nastaven")); return; }
+    QNetworkReply *reply = network_.get(bridgeRequest(QStringLiteral("v1/ivr/%1").arg(slot)));
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        const QJsonDocument json = QJsonDocument::fromJson(reply->readAll());
+        if (reply->error() != QNetworkReply::NoError || !json.isObject()) setStatus(QStringLiteral("IVR script nelze načíst"));
+        else { ivrScript_ = json.object().value(QStringLiteral("script")).toString(); emit bridgeChanged(); setStatus(QStringLiteral("IVR script načten")); }
+        reply->deleteLater();
+    });
+}
+
+void AppController::saveBridgeIvr(int slot, const QString &script)
+{
+    static const QRegularExpression command(QStringLiteral("^(answer|hangup|play:(?:https?://\\S+|\\d{1,3})|play2:(?:https?://\\S+|\\d{1,3})|playnumber:\\d{1,6}|dial:\\S+|setclip:\\+?\\d+|uri:https?://\\S+)$"));
+    QStringList lines;
+    for (QString line : script.split(QRegularExpression(QStringLiteral("\\r?\\n")))) if (!(line = line.trimmed()).isEmpty()) lines << line;
+    if (slot < 1 || slot > 99 || lines.isEmpty() || lines.size() > 100 || std::ranges::any_of(lines, [](const QString &line) { return !command.match(line).hasMatch(); })) {
+        setStatus(QStringLiteral("Neplatný IVR script nebo slot")); return;
+    }
+    if (!bridgeBaseUrl_.isValid() || bridgeToken_.isEmpty()) { setStatus(QStringLiteral("Bridge není nastaven")); return; }
+    QNetworkRequest request = bridgeRequest(QStringLiteral("v1/ivr/%1").arg(slot));
+    QNetworkReply *reply = network_.put(request, QJsonDocument(QJsonObject{{QStringLiteral("script"), lines.join(QLatin1Char('\n'))}}).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, normalized = lines.join(QLatin1Char('\n'))] {
+        const QJsonDocument json = QJsonDocument::fromJson(reply->readAll());
+        if (reply->error() != QNetworkReply::NoError || json.object().value(QStringLiteral("ok")).toBool() != true) setStatus(QStringLiteral("IVR script nelze uložit"));
+        else { ivrScript_ = normalized; emit bridgeChanged(); setStatus(QStringLiteral("IVR script uložen")); }
+        reply->deleteLater();
+    });
 }
 
 QNetworkRequest AppController::bridgeRequest(const QString &path) const

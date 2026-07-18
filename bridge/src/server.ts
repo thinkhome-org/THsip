@@ -62,6 +62,11 @@ export async function createApp(deps: Dependencies): Promise<FastifyInstance> {
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   await app.register(multipart, { limits: { files: 1, fileSize: 10 * 1024 * 1024, fields: 20 } });
   await app.register(websocket);
+  const live = new Set<{ send(data: string): void; on(event: "close", listener: () => void): void; readyState: number }>();
+  const broadcast = (message: unknown) => {
+    const data = JSON.stringify(message);
+    for (const socket of live) if (socket.readyState === 1) socket.send(data);
+  };
 
   const ingress = async (request: FastifyRequest, reply: FastifyReply) => {
     const query = (request.query ?? {}) as Record<string, unknown>;
@@ -79,7 +84,9 @@ export async function createApp(deps: Dependencies): Promise<FastifyInstance> {
       const callId = raw.sip_in_callid || raw.callid || raw.call_id;
       if (!callId) return reply.code(400).send({ error: "missing Call-ID" });
       const occurredAt = raw.time || new Date().toISOString();
-      const inserted = await deps.store.addEvent({ kind, callId, line: raw.line, from: raw.from, to: raw.to, status: raw.status, occurredAt, raw });
+      const event = { kind, callId, line: raw.line, from: raw.from, to: raw.to, status: raw.status, occurredAt, raw };
+      const inserted = await deps.store.addEvent(event);
+      if (inserted) broadcast({ type: "event", event });
       return { ok: true, duplicate: !inserted };
     }});
   }
@@ -150,8 +157,9 @@ export async function createApp(deps: Dependencies): Promise<FastifyInstance> {
   });
   app.get("/v1/ivr/:slot", { preHandler: client }, async request => ({ script: await deps.store.getIvr(Number((request.params as { slot: string }).slot)) }));
   app.get("/v1/stream", { websocket: true, preValidation: client }, socket => {
+    live.add(socket);
     const timer = setInterval(() => socket.send(JSON.stringify({ type: "ping", at: new Date().toISOString() })), 25_000);
-    socket.on("close", () => clearInterval(timer));
+    socket.on("close", () => { clearInterval(timer); live.delete(socket); });
   });
   app.get("/health", async () => ({ ok: true }));
   return app;
