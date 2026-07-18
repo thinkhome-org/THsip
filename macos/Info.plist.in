@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>cz.thinkhome.thsip</string>
+  <key>CFBundleName</key><string>THsip</string>
+  <key>CFBundleDisplayName</key><string>THsip</string>
+  <key>CFBundleExecutable</key><string>thsip</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
+  <key>NSMicrophoneUsageDescription</key><string>THsip potřebuje mikrofon pro VoIP hovory.</string>
+  <key>NSCameraUsageDescription</key><string>THsip potřebuje kameru pro videohovory.</string>
+  <key>NSContactsUsageDescription</key><string>THsip používá kontakty pro identifikaci a vytáčení.</string>
+</dict></plist>

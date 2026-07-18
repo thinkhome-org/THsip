@@ -1,0 +1,8 @@
+.DS_Store
+build/
+node_modules/
+bridge/dist/
+bridge/coverage/
+*.user
+*.log
+.env

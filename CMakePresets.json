@@ -1,0 +1,29 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "macos-arm64-debug",
+      "displayName": "macOS arm64 Debug",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "macos-arm64-release",
+      "inherits": "macos-arm64-debug",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "macos-arm64-debug" },
+    { "name": "release", "configurePreset": "macos-arm64-release" }
+  ],
+  "testPresets": [
+    { "name": "debug", "configurePreset": "macos-arm64-debug", "output": { "outputOnFailure": true } }
+  ]
+}
