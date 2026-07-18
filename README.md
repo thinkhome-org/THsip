@@ -67,7 +67,9 @@ Diagnostika ukazuje PJSIP transporty/registrace/NAT události, média, zařízen
 
 macOS adaptér používá Notification Center, Dock badge, systémový ringtone, oprávnění mikrofonu/kamery a IOKit sleep assertion po dobu hovoru. Vše je za zachovaným `IPlatformIntegration`; ostatní platformy mají bezpečný stub pro budoucí nativní adaptéry.
 
-Citlivé údaje nejsou v repo ani SQLite. macOS ukládá API heslo přímo do systémového Keychainu; Windows/Linux target zapojí QtKeychain. Aktuální lokální build používá Qt `QSQLITE`; produkční build gate musí dodat a reopen testem ověřit SQLCipher Qt driver. Samotná položka `sqlcipher` ve `vcpkg.json` šifrování Qt databáze nezapíná.
+PJSUA2 endpoint, transporty, příkazy, callbacky i destrukce objektů běží na jediném telephony workeru. Qt/QML dostává jen hodnotové události přes queued connections; GUI thread nikdy přímo nevolá PJSIP.
+
+Citlivé údaje nejsou v repo ani plaintext SQLite. macOS ukládá API heslo i náhodný 256bit databázový klíč do systémového Keychainu; Windows/Linux target zapojí QtKeychain. Release bundle přepíná Qt `QSQLITE` driver na bundlovaný SQLCipher, starou plaintext DB jednorázově atomicky migruje a fail-closed self-testem ověřuje šifrované znovuotevření. Debug build ponechává běžný `QSQLITE` pro rychlý vývoj.
 
 ## Licence
 

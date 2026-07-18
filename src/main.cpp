@@ -2,6 +2,8 @@
 #include "platformintegration.h"
 
 #include <QGuiApplication>
+#include <QFile>
+#include <QSqlQuery>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 
@@ -23,7 +25,23 @@ int main(int argc, char *argv[])
     QGuiApplication::setApplicationName(QStringLiteral("THsip"));
 
     AppController controller;
+    if (app.arguments().contains(QStringLiteral("--database-self-test")) || app.arguments().contains(QStringLiteral("--database-migration-self-test"))) {
+        QFile file(controller.databasePath());
+        const bool encrypted = file.open(QIODevice::ReadOnly) && file.read(16) != QByteArrayLiteral("SQLite format 3\0");
+        bool migration = true;
+        if (app.arguments().contains(QStringLiteral("--database-migration-self-test"))) {
+            QSqlQuery query(QSqlDatabase::database(QStringLiteral("thsip-main")));
+            migration = query.exec(QStringLiteral("SELECT value FROM migration_probe")) && query.next() && query.value(0).toString() == QLatin1String("ok");
+        }
+        return encrypted && migration && controller.systemDiagnostics().value(QStringLiteral("sqlCipher")).toString() != QLatin1String("not-active") ? 0 : 2;
+    }
     PlatformIntegration platform;
+#ifdef THSIP_HAVE_PJSIP
+    if (app.arguments().contains(QStringLiteral("--telephony-self-test"))) {
+        TelephonyEngine telephony;
+        return telephony.diagnostics().value(QStringLiteral("available")).toBool() ? 0 : 3;
+    }
+#endif
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("backend"), &controller);
     engine.rootContext()->setContextProperty(QStringLiteral("platform"), &platform);

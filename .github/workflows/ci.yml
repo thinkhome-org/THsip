@@ -12,7 +12,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: brew install qt qtwebengine qtwebsockets libphonenumber
+      - run: brew install qt qtwebengine qtwebsockets libphonenumber boost opus libvpx sqlcipher
       - run: cmake --preset macos-arm64-release
       - run: cmake --build --preset release -j 3
       - run: ctest --test-dir build/release --output-on-failure

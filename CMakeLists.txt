@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 project(THsip VERSION 0.1.0 LANGUAGES C CXX OBJC OBJCXX)
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 NEW)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +14,7 @@ option(THSIP_FETCH_PJSIP "Fetch pinned PJSIP when not installed" ON)
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Network Sql Multimedia Test WebSockets)
 find_package(Qt6 QUIET COMPONENTS Svg VirtualKeyboard VirtualKeyboardQml)
+find_package(Boost QUIET COMPONENTS date_time)
 find_package(unofficial-libphonenumber CONFIG QUIET)
 find_package(libphonenumber CONFIG QUIET)
 if(THSIP_WITH_WEBENGINE)
@@ -40,6 +44,7 @@ qt_add_qml_module(thsip
   QML_FILES qml/Main.qml
   RESOURCES resources/capabilities.json resources/api_endpoints.json resources/dial_actions.json
 )
+target_compile_definitions(thsip PRIVATE "$<$<CONFIG:Release>:THSIP_REQUIRE_SQLCIPHER=1>")
 
 target_link_libraries(thsip PRIVATE
   Qt6::Core Qt6::Gui Qt6::Quick Qt6::Network Qt6::Sql Qt6::Multimedia
@@ -50,6 +55,7 @@ target_link_libraries(thsip PRIVATE
   "$<$<PLATFORM_ID:Darwin>:-framework AppKit>"
   "$<$<PLATFORM_ID:Darwin>:-framework AVFoundation>"
   "$<$<PLATFORM_ID:Darwin>:-framework IOKit>"
+  "$<$<PLATFORM_ID:Darwin>:-framework MetalKit>"
   "$<$<PLATFORM_ID:Darwin>:-framework UserNotifications>"
 )
 
@@ -80,6 +86,8 @@ if(THSIP_WITH_PJSIP)
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(PJMEDIA_WITH_VIDEO ON CACHE BOOL "" FORCE)
     set(PJMEDIA_WITH_FFMPEG OFF CACHE BOOL "" FORCE)
+    set(PJMEDIA_WITH_VIDEODEV_SDL OFF CACHE BOOL "" FORCE)
+    set(PJMEDIA_WITH_VIDEODEV_METAL ON CACHE BOOL "" FORCE)
     FetchContent_Declare(pjproject
       GIT_REPOSITORY https://github.com/pjsip/pjproject.git
       GIT_TAG 2.17

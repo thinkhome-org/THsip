@@ -22,6 +22,7 @@
 #include <QTimer>
 #include <QDataStream>
 #include <QRegularExpression>
+#include <QRandomGenerator>
 #include <QSaveFile>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -166,6 +167,64 @@ QVariantList parseContactFile(const QString &path, QString *error)
     }
     if (contacts.isEmpty() && error->isEmpty()) *error = QStringLiteral("Soubor neobsahuje kontakt s telefonem");
     return contacts;
+}
+
+QString sqlCipherVersion(QSqlDatabase &database)
+{
+    QSqlQuery query(database);
+    return query.exec(QStringLiteral("PRAGMA cipher_version")) && query.next() ? query.value(0).toString() : QString();
+}
+
+bool applyDatabaseKey(QSqlDatabase &database, const QString &key, QString *error)
+{
+    QSqlQuery query(database);
+    if (!query.exec(QStringLiteral("PRAGMA key = \"x'%1'\"").arg(key)) ||
+        !query.exec(QStringLiteral("SELECT count(*) FROM sqlite_master")) || !query.next()) {
+        if (error) *error = query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+QString loadOrCreateDatabaseKey()
+{
+    const QString testKey = qEnvironmentVariable("THSIP_DATABASE_TEST_KEY");
+    if (testKey.size() == 64 && QRegularExpression(QStringLiteral("^[0-9a-f]{64}$")).match(testKey).hasMatch()) return testKey;
+    const QString account = QStringLiteral("local-database-key");
+    QString key = SecretStore::load(account);
+    if (!key.isEmpty()) return key;
+    QByteArray generated;
+    for (int i = 0; i < 4; ++i)
+        generated += QByteArray::number(QRandomGenerator::system()->generate64(), 16).rightJustified(16, '0');
+    key = QString::fromLatin1(generated);
+    return SecretStore::save(account, key) ? key : QString();
+}
+
+bool migratePlaintextDatabase(QSqlDatabase &database, const QString &path, const QString &key, QString *error)
+{
+    const QString encryptedPath = path + QStringLiteral(".encrypted");
+    QFile::remove(encryptedPath);
+    QString escaped = encryptedPath;
+    escaped.replace(QLatin1Char('\''), QStringLiteral("''"));
+    {
+        QSqlQuery query(database);
+        if (!query.exec(QStringLiteral("ATTACH DATABASE '%1' AS encrypted KEY \"x'%2'\"").arg(escaped, key)) ||
+            !query.exec(QStringLiteral("SELECT sqlcipher_export('encrypted')")) || !query.next() ||
+            !query.exec(QStringLiteral("DETACH DATABASE encrypted"))) {
+            if (error) *error = query.lastError().text();
+            return false;
+        }
+    }
+    database.close();
+    const QString backupPath = path + QStringLiteral(".plaintext-migration");
+    QFile::remove(backupPath);
+    if (!QFile::rename(path, backupPath) || !QFile::rename(encryptedPath, path)) {
+        if (!QFile::exists(path)) QFile::rename(backupPath, path);
+        if (error) *error = QStringLiteral("Databázi nelze atomicky nahradit");
+        return false;
+    }
+    QFile::remove(backupPath);
+    return true;
 }
 }
 
@@ -1462,11 +1521,42 @@ QString AppController::databasePath() const { return database_.databaseName(); }
 
 void AppController::initializeDatabase()
 {
-    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QString dir = qEnvironmentVariable("THSIP_DATA_DIR");
+    if (dir.isEmpty()) dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(dir);
+    const QString path = dir + QStringLiteral("/thsip.sqlite");
+    bool plaintext = false;
+    if (QFile file(path); file.open(QIODevice::ReadOnly)) plaintext = file.read(16) == QByteArrayLiteral("SQLite format 3\0");
     database_ = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("thsip-main"));
-    database_.setDatabaseName(dir + QStringLiteral("/thsip.sqlite"));
+    database_.setDatabaseName(path);
     if (!database_.open()) { setStatus(QStringLiteral("DB chyba: %1").arg(database_.lastError().text())); return; }
+#ifdef THSIP_REQUIRE_SQLCIPHER
+    if (sqlCipherVersion(database_).isEmpty()) {
+        database_.close();
+        setStatus(QStringLiteral("DB chyba: release vyžaduje SQLCipher driver"));
+        return;
+    }
+    const QString databaseKey = loadOrCreateDatabaseKey();
+    if (databaseKey.isEmpty()) {
+        database_.close();
+        setStatus(QStringLiteral("DB chyba: šifrovací klíč nelze uložit do Keychainu"));
+        return;
+    }
+    QString cipherError;
+    if (plaintext && !migratePlaintextDatabase(database_, path, databaseKey, &cipherError)) {
+        setStatus(QStringLiteral("DB migrace do SQLCipher selhala: %1").arg(cipherError));
+        return;
+    }
+    if (!database_.isOpen() && !database_.open()) {
+        setStatus(QStringLiteral("DB po migraci nelze otevřít: %1").arg(database_.lastError().text()));
+        return;
+    }
+    if (!applyDatabaseKey(database_, databaseKey, &cipherError)) {
+        database_.close();
+        setStatus(QStringLiteral("DB SQLCipher klíč selhal: %1").arg(cipherError));
+        return;
+    }
+#endif
     QSqlQuery q(database_);
     const QStringList schema {
         QStringLiteral("PRAGMA foreign_keys=ON"),
@@ -1503,7 +1593,15 @@ void AppController::initializeDatabase()
         setStatus(QStringLiteral("DB migrace selhala: %1").arg(q.lastError().text()));
         return;
     }
-    if (!database_.commit()) setStatus(QStringLiteral("DB migraci nelze uložit: %1").arg(database_.lastError().text()));
+    if (!database_.commit()) { setStatus(QStringLiteral("DB migraci nelze uložit: %1").arg(database_.lastError().text())); return; }
+#ifdef THSIP_REQUIRE_SQLCIPHER
+    database_.close();
+    QString reopenError;
+    if (!database_.open() || !applyDatabaseKey(database_, databaseKey, &reopenError)) {
+        database_.close();
+        setStatus(QStringLiteral("DB SQLCipher reopen test selhal: %1").arg(reopenError));
+    }
+#endif
 }
 
 void AppController::setStatus(QString value) { if (status_ == value) return; status_ = std::move(value); emit statusChanged(); }

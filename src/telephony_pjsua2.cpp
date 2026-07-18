@@ -10,6 +10,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <deque>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -80,36 +82,64 @@ class TelephonyEngine::Private {
 public:
     explicit Private(TelephonyEngine *q) : q(q), endpoint(this)
     {
-        endpoint.libCreate();
-        pj::EpConfig config;
-        config.uaConfig.threadCnt = 0;
-        config.uaConfig.mainThreadOnly = false;
-        config.logConfig.level = 4;
-        endpoint.libInit(config);
-        pj::TransportConfig udp; udp.port = 0;
-        endpoint.transportCreate(PJSIP_TRANSPORT_UDP, udp);
-        pj::TransportConfig tcp; tcp.port = 0;
-        endpoint.transportCreate(PJSIP_TRANSPORT_TCP, tcp);
-        try { pj::TransportConfig tls; tls.port = 0; endpoint.transportCreate(PJSIP_TRANSPORT_TLS, tls); }
-        catch (const pj::Error &) { /* TLS availability reported by registration failure. */ }
-        endpoint.libStart();
-        worker = std::jthread([this](std::stop_token stop) {
-            endpoint.libRegisterThread("thsip-pjsip");
-            while (!stop.stop_requested()) endpoint.libHandleEvents(20);
+        std::promise<void> ready;
+        auto initialized = ready.get_future();
+        worker = std::jthread([this, &ready](std::stop_token stop) {
+            try {
+                endpoint.libCreate();
+                pj::EpConfig config;
+                config.uaConfig.threadCnt = 0;
+                config.uaConfig.mainThreadOnly = false;
+                config.logConfig.level = 4;
+                endpoint.libInit(config);
+                pj::TransportConfig udp; udp.port = 0;
+                endpoint.transportCreate(PJSIP_TRANSPORT_UDP, udp);
+                pj::TransportConfig tcp; tcp.port = 0;
+                endpoint.transportCreate(PJSIP_TRANSPORT_TCP, tcp);
+                try { pj::TransportConfig tls; tls.port = 0; endpoint.transportCreate(PJSIP_TRANSPORT_TLS, tls); }
+                catch (const pj::Error &) { /* TLS availability reported by registration failure. */ }
+                endpoint.libStart();
+                ready.set_value();
+            } catch (...) {
+                ready.set_exception(std::current_exception());
+                return;
+            }
+            while (!stop.stop_requested()) {
+                std::deque<std::function<void()>> pending;
+                { std::scoped_lock lock(commandMutex); pending.swap(commands); }
+                for (auto &command : pending) command();
+                endpoint.libHandleEvents(20);
+            }
+            std::scoped_lock lock(mutex);
+            recorders.clear(); calls.clear(); buddies.clear(); accounts.clear();
+            endpoint.libDestroy();
         });
+        initialized.get();
     }
     ~Private()
     {
         worker.request_stop();
         worker.join();
-        std::scoped_lock lock(mutex);
-        recorders.clear(); calls.clear(); buddies.clear(); accounts.clear();
-        endpoint.libDestroy();
     }
     template<class Function> void protect(const QString &operation, Function function)
     {
-        try { std::scoped_lock lock(mutex); endpoint.libRegisterThread("thsip-qt"); function(); }
-        catch (const pj::Error &e) { const QString message = QString::fromStdString(e.info()); recordEvent(QStringLiteral("error"), {{QStringLiteral("operation"), operation}, {QStringLiteral("message"), message}}); emit q->error(operation, message); }
+        auto done = std::make_shared<std::promise<void>>();
+        auto result = done->get_future();
+        {
+            std::scoped_lock lock(commandMutex);
+            commands.emplace_back([this, operation, function=std::move(function), done]() mutable {
+                try { std::scoped_lock lock(mutex); function(); }
+                catch (const pj::Error &e) {
+                    const QString message = QString::fromStdString(e.info());
+                    recordEvent(QStringLiteral("error"), {{QStringLiteral("operation"), operation}, {QStringLiteral("message"), message}});
+                    emit q->error(operation, message);
+                }
+                catch (const std::exception &e) { emit q->error(operation, QString::fromUtf8(e.what())); }
+                catch (...) { emit q->error(operation, QStringLiteral("unknown telephony error")); }
+                done->set_value();
+            });
+        }
+        result.get();
     }
     ThsipCall *call(const QString &id)
     {
@@ -161,6 +191,8 @@ public:
     TelephonyEngine *q;
     ThsipEndpoint endpoint;
     std::jthread worker;
+    std::mutex commandMutex;
+    std::deque<std::function<void()>> commands;
     std::recursive_mutex mutex;
     std::unordered_map<std::string, std::unique_ptr<ThsipAccount>> accounts;
     std::unordered_map<std::string, std::unique_ptr<ThsipCall>> calls;
@@ -185,11 +217,13 @@ void ThsipCall::onCallState(pj::OnCallStateParam &)
     const bool disconnected = getInfo().state == PJSIP_INV_STATE_DISCONNECTED;
     owner->publish(*this);
     if (!disconnected) return;
-    QMetaObject::invokeMethod(owner->q, [owner=owner, id=publicId] {
+    std::scoped_lock queueLock(owner->commandMutex);
+    owner->commands.emplace_back([owner=owner, id=publicId] {
         std::scoped_lock lock(owner->mutex);
-        if (owner->recorders.erase(id.toStdString())) emit owner->q->recordingState(id, false, QString());
+        const bool wasRecording = owner->recorders.erase(id.toStdString());
         owner->calls.erase(id.toStdString());
-    }, Qt::QueuedConnection);
+        if (wasRecording) QMetaObject::invokeMethod(owner->q, [q=owner->q, id] { emit q->recordingState(id, false, QString()); }, Qt::QueuedConnection);
+    });
 }
 void ThsipCall::onCallMediaState(pj::OnCallMediaStateParam &)
 {
