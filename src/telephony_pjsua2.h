@@ -33,6 +33,9 @@ public:
     Q_INVOKABLE QVariantList codecs();
     Q_INVOKABLE void setCodecPriority(const QString &codecId, int priority);
     Q_INVOKABLE QVariantList mediaStatistics(const QString &callId);
+    Q_INVOKABLE QVariantMap diagnostics();
+    Q_INVOKABLE void detectNat(const QString &stunServer);
+    Q_INVOKABLE void setAudioLoopback(bool enabled);
 signals:
     void accountState(QString accountId, bool registered, QString reason);
     void callState(QString callId, QVariantMap state);
@@ -42,6 +45,7 @@ signals:
     void buddyState(QString buddyId, QVariantMap state);
     void recordingState(QString callId, bool recording, QString path);
     void error(QString operation, QString message);
+    void diagnosticEvent(QVariantMap event);
 private:
     std::unique_ptr<Private> d;
 };

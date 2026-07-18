@@ -18,8 +18,8 @@ ApplicationWindow {
         { label: "Odorik API", page: 2 }, { label: "SMS", page: 3 },
         { label: "SIM", page: 4 }, { label: "Kontakty", page: 5 },
         { label: "Routing", page: 6 }, { label: "Nahrávky", page: 7 },
-        { label: "Funkce", page: 8 }, { label: "Portál", page: 9 },
-        { label: "Nastavení", page: 10 }
+        { label: "Funkce", page: 8 }, { label: "Diagnostika", page: 9 },
+        { label: "Portál", page: 10 }, { label: "Nastavení", page: 11 }
     ]
     property string sipAccountId: ""
     property string currentCallId: ""
@@ -35,6 +35,25 @@ ApplicationWindow {
     property var videoDeviceList: []
     property var codecList: []
     property string exportRecordingId: ""
+    property var telephonyDiagnostics: ({})
+    property var diagnosticEvents: []
+    property var systemDiagnosticData: ({})
+
+    function money(value) { return Number(value || 0).toLocaleString(Qt.locale("cs_CZ"), "f", 2) + " Kč" }
+    function duration(value) {
+        let seconds = Number(value || 0)
+        return Math.floor(seconds / 3600) + " h " + Math.floor((seconds % 3600) / 60) + " min"
+    }
+    function periodValue(period, key) {
+        let value = backend.dashboard[period]
+        return value ? value[key] || 0 : 0
+    }
+    function registeredLines() {
+        let count = 0
+        let lines = backend.dashboard.lines || []
+        for (let line of lines) if ((line.connected_devices || []).length > 0) ++count
+        return count
+    }
 
     FileDialog {
         id: contactFile
@@ -56,6 +75,9 @@ ApplicationWindow {
         audioOutput: recordingAudio
         onSourceChanged: if (source) play()
     }
+    SoundEffect { id: testTone; source: backend.testToneUrl() }
+    Camera { id: diagnosticCamera; active: false }
+    CaptureSession { camera: diagnosticCamera; videoOutput: diagnosticVideo }
 
     component ApiPanel: Pane {
         id: apiPanel
@@ -163,6 +185,13 @@ ApplicationWindow {
         function onRecordingState(callId, recording, path) {
             if (callId === root.currentCallId) root.recordingPath = recording ? path : ""
         }
+        function onDiagnosticEvent(event) {
+            root.diagnosticEvents = [event].concat(root.diagnosticEvents).slice(0, 500)
+            root.telephonyDiagnostics = telephony.diagnostics()
+        }
+        function onAccountState(accountId, registered, reason) {
+            root.currentCallState = (registered ? "SIP registrován" : "SIP odpojen") + (reason ? " · " + reason : "")
+        }
         function onError(operation, message) { root.currentCallState = operation + ": " + message }
     }
 
@@ -212,11 +241,23 @@ ApplicationWindow {
                 ColumnLayout {
                     width: Math.max(700, parent.width)
                     spacing: 14
-                    Label { text: "Přehled"; font.pixelSize: 28; font.bold: true }
                     RowLayout {
-                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Kredit"; opacity: .7 } Label { text: backend.balance; font.pixelSize: 28 } Button { text: "Obnovit"; onClicked: backend.refreshBalance() } } }
-                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Capability katalog"; opacity: .7 } Label { text: backend.capabilities.length + " položek"; font.pixelSize: 28 } Label { text: "REST, SIP, prefixy, bridge, portál" } } }
-                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Lokální data"; opacity: .7 } Label { text: "SQLite"; font.pixelSize: 28 } Label { text: backend.databasePath(); elide: Text.ElideMiddle; Layout.maximumWidth: 270 } } }
+                        Label { text: "Přehled"; font.pixelSize: 28; font.bold: true }
+                        Item { Layout.fillWidth: true }
+                        BusyIndicator { running: backend.dashboard.loading || false; visible: running; implicitWidth: 30; implicitHeight: 30 }
+                        Label { text: backend.dashboard.refreshedAt ? "Aktualizováno " + backend.dashboard.refreshedAt : ""; opacity: .65 }
+                        Button { text: "Obnovit"; enabled: !backend.dashboard.loading; onClicked: backend.refreshDashboard() }
+                    }
+                    GridLayout {
+                        Layout.fillWidth: true; columns: 4
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Kredit"; opacity: .7 } Label { text: backend.balance; font.pixelSize: 25; font.bold: true } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Dnes"; opacity: .7 } Label { text: root.money(root.periodValue("today", "price")); font.pixelSize: 25; font.bold: true } Label { text: root.periodValue("today", "count") + " hovorů · " + root.duration(root.periodValue("today", "length")) } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Tento týden"; opacity: .7 } Label { text: root.money(root.periodValue("week", "price")); font.pixelSize: 25; font.bold: true } Label { text: root.periodValue("week", "count") + " hovorů · " + root.duration(root.periodValue("week", "length")) } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Tento měsíc"; opacity: .7 } Label { text: root.money(root.periodValue("month", "price")); font.pixelSize: 25; font.bold: true } Label { text: root.periodValue("month", "count") + " hovorů · " + root.duration(root.periodValue("month", "length")) } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Aktivní hovory"; opacity: .7 } Label { text: (backend.dashboard.activeCalls || []).length; font.pixelSize: 25; font.bold: true } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Zmeškané cíle"; opacity: .7 } Label { text: (backend.dashboard.missed || []).length; font.pixelSize: 25; font.bold: true } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Registrované linky"; opacity: .7 } Label { text: root.registeredLines() + " / " + (backend.dashboard.lines || []).length; font.pixelSize: 25; font.bold: true } } }
+                        Frame { Layout.fillWidth: true; ColumnLayout { Label { text: "Odorik SIM"; opacity: .7 } Label { text: (backend.dashboard.simCards || []).length; font.pixelSize: 25; font.bold: true } } }
                     }
                     Label { text: "Rychlé akce"; font.pixelSize: 20; font.bold: true }
                     RowLayout {
@@ -225,7 +266,63 @@ ApplicationWindow {
                         Button { text: "Callback"; onClicked: pages.currentIndex = 2 }
                         Button { text: "Routing"; onClicked: pages.currentIndex = 6 }
                     }
-                    TextArea { Layout.fillWidth: true; Layout.preferredHeight: 300; readOnly: true; text: backend.output; wrapMode: TextEdit.WrapAnywhere }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.alignment: Qt.AlignTop
+                        Frame {
+                            Layout.fillWidth: true; Layout.alignment: Qt.AlignTop
+                            ColumnLayout {
+                                anchors.fill: parent
+                                Label { text: "Náklady podle linek · měsíc"; font.pixelSize: 18; font.bold: true }
+                                Repeater {
+                                    model: backend.dashboard.byLine || []
+                                    RowLayout {
+                                        required property var modelData
+                                        Layout.fillWidth: true
+                                        Label { text: modelData.line; Layout.fillWidth: true }
+                                        Label { text: modelData.count + " hovorů"; opacity: .7 }
+                                        Label { text: root.money(modelData.price); font.bold: true }
+                                    }
+                                }
+                                Label { visible: !(backend.dashboard.byLine || []).length; text: "Bez dat"; opacity: .6 }
+                            }
+                        }
+                        Frame {
+                            Layout.fillWidth: true; Layout.alignment: Qt.AlignTop
+                            ColumnLayout {
+                                anchors.fill: parent
+                                Label { text: "Destinace · měsíc"; font.pixelSize: 18; font.bold: true }
+                                Repeater {
+                                    model: (backend.dashboard.destinations || []).slice(0, 8)
+                                    RowLayout {
+                                        required property var modelData
+                                        Layout.fillWidth: true
+                                        Label { text: modelData.destination || "—"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                        Label { text: modelData.count + "×"; opacity: .7 }
+                                        Label { text: root.money(modelData.price); font.bold: true }
+                                    }
+                                }
+                                Label { visible: !(backend.dashboard.destinations || []).length; text: "Bez dat"; opacity: .6 }
+                            }
+                        }
+                    }
+                    Frame {
+                        Layout.fillWidth: true
+                        ColumnLayout {
+                            anchors.fill: parent
+                            Label { text: "SIM stav"; font.pixelSize: 18; font.bold: true }
+                            Repeater {
+                                model: backend.dashboard.simCards || []
+                                RowLayout {
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    Label { text: modelData.phone_number || modelData.line || "SIM"; Layout.fillWidth: true }
+                                    Label { text: modelData.state || "—"; font.bold: true }
+                                    Label { text: modelData.changes_in_progress ? "změna probíhá" : ""; opacity: .7 }
+                                }
+                            }
+                            Label { visible: !(backend.dashboard.simCards || []).length; text: "Žádná SIM"; opacity: .6 }
+                        }
+                    }
                 }
             }
 
@@ -585,6 +682,66 @@ ApplicationWindow {
                                 Label { text: modelData.category + " · " + modelData.mechanism + " · " + modelData.status; opacity: .7 }
                             }
                         }
+                    }
+                }
+            }
+
+            Pane {
+                id: diagnosticsPage
+                Component.onCompleted: {
+                    root.systemDiagnosticData = backend.systemDiagnostics()
+                    if (backend.pjsipAvailable) root.telephonyDiagnostics = telephony.diagnostics()
+                }
+                ColumnLayout {
+                    anchors.fill: parent
+                    RowLayout {
+                        Label { text: "Diagnostika"; font.pixelSize: 28; font.bold: true }
+                        Item { Layout.fillWidth: true }
+                        Button { text: "DNS/TCP/TLS test"; onClicked: backend.runNetworkDiagnostics() }
+                        Button { text: "Obnovit PJSIP"; enabled: backend.pjsipAvailable; onClicked: root.telephonyDiagnostics = telephony.diagnostics() }
+                        Button { text: "Export redacted bundle"; onClicked: backend.exportDiagnostics(backend.pjsipAvailable ? telephony.diagnostics() : {}) }
+                    }
+                    RowLayout {
+                        TextField { id: diagnosticStun; text: "stun.odorik.cz:3478"; placeholderText: "STUN server"; Layout.fillWidth: true }
+                        Button { text: "STUN/NAT test"; enabled: backend.pjsipAvailable; onClicked: telephony.detectNat(diagnosticStun.text) }
+                        Button { text: "Test tón"; onClicked: testTone.play() }
+                        CheckBox { text: "Mikrofon do reproduktoru"; enabled: backend.pjsipAvailable; onToggled: telephony.setAudioLoopback(checked) }
+                        CheckBox { text: "Kamera"; onToggled: diagnosticCamera.active = checked }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.preferredHeight: 180
+                        Frame {
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            ColumnLayout {
+                                anchors.fill: parent
+                                Label { text: "Systém / PJSIP"; font.bold: true }
+                                TextArea { Layout.fillWidth: true; Layout.fillHeight: true; readOnly: true; font.family: "Menlo"; wrapMode: TextEdit.WrapAnywhere; text: JSON.stringify({system:root.systemDiagnosticData,telephony:root.telephonyDiagnostics}, null, 2) }
+                            }
+                        }
+                        VideoOutput { id: diagnosticVideo; Layout.preferredWidth: 260; Layout.fillHeight: true; visible: diagnosticCamera.active }
+                    }
+                    Label { text: "Odorik síťové testy"; font.pixelSize: 20; font.bold: true }
+                    ListView {
+                        Layout.fillWidth: true; Layout.preferredHeight: Math.min(160, contentHeight); model: backend.networkDiagnostics; clip: true
+                        delegate: RowLayout {
+                            required property var modelData; width: ListView.view.width
+                            Label { text: modelData.kind.toUpperCase(); Layout.preferredWidth: 55; font.bold: true }
+                            Label { text: modelData.target; Layout.preferredWidth: 190 }
+                            Label { text: modelData.status; color: modelData.status === "ok" ? "#2e7d32" : modelData.status === "running" ? palette.text : "#b00020"; Layout.preferredWidth: 70 }
+                            Label { text: modelData.detail || ""; Layout.fillWidth: true; elide: Text.ElideMiddle }
+                        }
+                    }
+                    RowLayout {
+                        Label { text: "Odorik audio testy:"; font.bold: true }
+                        Button { text: "DTMF *080"; onClicked: { destination.text = "*080"; pages.currentIndex = 1 } }
+                        Button { text: "Echo *081"; onClicked: { destination.text = "*081"; pages.currentIndex = 1 } }
+                        Button { text: "Recording *0811"; onClicked: { destination.text = "*0811"; pages.currentIndex = 1 } }
+                        Label { text: "ALG symptom: selhává 5060, ale 6688/443 funguje. Aplikace pouze ukáže výsledky; nedeklaruje jistotu bez SIP trace."; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
+                    }
+                    Label { text: "Registration / NAT / call log"; font.pixelSize: 20; font.bold: true }
+                    ListView {
+                        Layout.fillWidth: true; Layout.fillHeight: true; model: root.diagnosticEvents; clip: true
+                        delegate: Label { required property var modelData; width: ListView.view.width; text: modelData.at + " · " + modelData.kind + " · " + JSON.stringify(modelData); elide: Text.ElideRight }
                     }
                 }
             }

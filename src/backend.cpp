@@ -12,6 +12,15 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QNetworkReply>
+#include <QNetworkInterface>
+#include <QHostInfo>
+#include <QTcpSocket>
+#include <QSslSocket>
+#include <QSslCipher>
+#include <QStorageInfo>
+#include <QSysInfo>
+#include <QTimer>
+#include <QDataStream>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSqlError>
@@ -22,6 +31,8 @@
 #include <QUuid>
 #include <QSet>
 #include <algorithm>
+#include <cmath>
+#include <numbers>
 
 #ifdef THSIP_HAVE_LIBPHONENUMBER
 #include <phonenumbers/phonenumber.pb.h>
@@ -251,6 +262,7 @@ AppController::AppController(QObject *parent) : QObject(parent)
     bridgeBaseUrl_ = settings.value(QStringLiteral("bridge/baseUrl")).toUrl();
     if (bridgeBaseUrl_.isValid()) bridgeToken_ = SecretStore::load(QStringLiteral("bridge-client-token"));
     loadRecordings();
+    if (!password_.isEmpty()) QTimer::singleShot(0, this, &AppController::refreshDashboard);
 }
 
 AppController::~AppController()
@@ -288,6 +300,7 @@ void AppController::configureAccount(const QString &user, const QString &passwor
     setStatus(SecretStore::save(QStringLiteral("odorik-api/") + user_, password_)
                   ? QStringLiteral("Účet bezpečně uložen v Keychainu")
                   : QStringLiteral("Účet nastaven; Keychain zápis selhal"));
+    refreshDashboard();
 }
 
 bool AppController::storeSipPassword(const QString &line, const QString &password)
@@ -481,6 +494,115 @@ void AppController::refreshContacts()
 
 void AppController::refreshBalance() { api(QStringLiteral("GET"), QStringLiteral("balance")); }
 
+QVariantMap AppController::summarizeStatistics(const QJsonObject &statistics)
+{
+    QVariantMap result;
+    qlonglong count = 0;
+    qlonglong length = 0;
+    double price = 0;
+    for (const QString &direction : {QStringLiteral("incoming"), QStringLiteral("outgoing"), QStringLiteral("redirected")}) {
+        const QJsonObject value = statistics.value(direction).toObject();
+        const QVariantMap summary{{QStringLiteral("count"), value.value(QStringLiteral("count")).toInteger()},
+                                  {QStringLiteral("length"), value.value(QStringLiteral("length")).toInteger()},
+                                  {QStringLiteral("price"), value.value(QStringLiteral("price")).toDouble()}};
+        result[direction] = summary;
+        count += summary.value(QStringLiteral("count")).toLongLong();
+        length += summary.value(QStringLiteral("length")).toLongLong();
+        price += summary.value(QStringLiteral("price")).toDouble();
+    }
+    result[QStringLiteral("count")] = count;
+    result[QStringLiteral("length")] = length;
+    result[QStringLiteral("price")] = price;
+    return result;
+}
+
+void AppController::finishDashboardRequest(quint64 generation)
+{
+    if (generation != dashboardGeneration_ || --dashboardPending_ > 0) return;
+    dashboard_[QStringLiteral("loading")] = false;
+    dashboard_[QStringLiteral("refreshedAt")] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    emit dashboardChanged();
+    setStatus(QStringLiteral("Přehled aktualizován"));
+}
+
+void AppController::refreshDashboard()
+{
+    if (user_.isEmpty() || password_.isEmpty()) { setStatus(QStringLiteral("Nejdřív nastav účet")); return; }
+    const quint64 generation = ++dashboardGeneration_;
+    dashboard_ = {{QStringLiteral("loading"), true}};
+    dashboardPending_ = 8;
+    emit dashboardChanged();
+    setStatus(QStringLiteral("Načítám přehled"));
+    refreshBalance();
+
+    const QDate today = QDate::currentDate();
+    const int daysFromMonday = today.dayOfWeek() - 1;
+    const auto start = [](const QDate &date) { return QDateTime(date, QTime(0, 0)).toString(Qt::ISODate); };
+    const QString now = QDateTime::currentDateTime().toString(Qt::ISODate);
+    const QVariantMap periods{
+        {QStringLiteral("today"), start(today)},
+        {QStringLiteral("week"), start(today.addDays(-daysFromMonday))},
+        {QStringLiteral("month"), start(QDate(today.year(), today.month(), 1))}
+    };
+    for (auto it = periods.cbegin(); it != periods.cend(); ++it) {
+        getJson(QStringLiteral("call_statistics.json"), {{QStringLiteral("from"), it.value()}, {QStringLiteral("to"), now}},
+                [this, generation, key = it.key()](const QJsonDocument &json) {
+                    if (generation == dashboardGeneration_) { dashboard_[key] = summarizeStatistics(json.object()); emit dashboardChanged(); }
+                    finishDashboardRequest(generation);
+                }, [this, generation] { finishDashboardRequest(generation); });
+    }
+
+    const QVariantMap month{{QStringLiteral("from"), periods.value(QStringLiteral("month"))}, {QStringLiteral("to"), now}};
+    getJson(QStringLiteral("call_statistics/by_destination.json"), month, [this, generation](const QJsonDocument &json) {
+        if (generation == dashboardGeneration_) { dashboard_[QStringLiteral("destinations")] = json.array().toVariantList(); emit dashboardChanged(); }
+        finishDashboardRequest(generation);
+    }, [this, generation] { finishDashboardRequest(generation); });
+    getJson(QStringLiteral("call_statistics/missed_calls.json"), month, [this, generation](const QJsonDocument &json) {
+        if (generation == dashboardGeneration_) { dashboard_[QStringLiteral("missed")] = json.array().toVariantList(); emit dashboardChanged(); }
+        finishDashboardRequest(generation);
+    }, [this, generation] { finishDashboardRequest(generation); });
+    getJson(QStringLiteral("active_calls.json"), {}, [this, generation](const QJsonDocument &json) {
+        if (generation == dashboardGeneration_) { dashboard_[QStringLiteral("activeCalls")] = json.array().toVariantList(); emit dashboardChanged(); }
+        finishDashboardRequest(generation);
+    }, [this, generation] { finishDashboardRequest(generation); });
+    getJson(QStringLiteral("sim_cards.json"), {}, [this, generation](const QJsonDocument &json) {
+        if (generation == dashboardGeneration_) {
+            const QJsonArray cards = json.isArray() ? json.array() : json.object().value(QStringLiteral("sim_cards")).toArray();
+            dashboard_[QStringLiteral("simCards")] = cards.toVariantList();
+            emit dashboardChanged();
+        }
+        finishDashboardRequest(generation);
+    }, [this, generation] { finishDashboardRequest(generation); });
+    getJson(QStringLiteral("lines.json"), {}, [this, generation, month](const QJsonDocument &json) {
+        if (generation != dashboardGeneration_) { finishDashboardRequest(generation); return; }
+        QVariantList safeLines;
+        for (const QJsonValue &value : json.array()) {
+            QJsonObject line = value.toObject();
+            line.remove(QStringLiteral("sip_password"));
+            safeLines << line.toVariantMap();
+            const QString id = line.value(QStringLiteral("id")).toVariant().toString();
+            if (id.isEmpty()) continue;
+            ++dashboardPending_;
+            QVariantMap query = month;
+            query[QStringLiteral("line")] = id;
+            getJson(QStringLiteral("call_statistics.json"), query, [this, generation, id](const QJsonDocument &stats) {
+                if (generation == dashboardGeneration_) {
+                    QVariantList byLine = dashboard_.value(QStringLiteral("byLine")).toList();
+                    QVariantMap summary = summarizeStatistics(stats.object());
+                    summary[QStringLiteral("line")] = id;
+                    byLine << summary;
+                    dashboard_[QStringLiteral("byLine")] = byLine;
+                    emit dashboardChanged();
+                }
+                finishDashboardRequest(generation);
+            }, [this, generation] { finishDashboardRequest(generation); });
+        }
+        dashboard_[QStringLiteral("lines")] = safeLines;
+        emit dashboardChanged();
+        finishDashboardRequest(generation);
+    }, [this, generation] { finishDashboardRequest(generation); });
+}
+
 void AppController::handleReply(QNetworkReply *reply, const QString &path, const QVariantMap &parameters, bool mutation)
 {
     const QByteArray data = reply->readAll();
@@ -650,15 +772,19 @@ bool AppController::knownRoutingNumber(const QString &number) const
     });
 }
 
-void AppController::getJson(const QString &path, const QVariantMap &parameters, std::function<void(QJsonDocument)> callback)
+void AppController::getJson(const QString &path, const QVariantMap &parameters, std::function<void(QJsonDocument)> callback,
+                            std::function<void()> failure)
 {
     if (user_.isEmpty() || password_.isEmpty()) { setStatus(QStringLiteral("Nejdřív nastav účet")); return; }
     QNetworkReply *reply = network_.get(QNetworkRequest(endpoint(path, parameters)));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, callback = std::move(callback)] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, callback = std::move(callback), failure = std::move(failure)] {
         const QByteArray body = reply->readAll();
         const QString error = odorikError(body);
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        if (reply->error() != QNetworkReply::NoError || status >= 400 || !error.isEmpty()) setStatus(QStringLiteral("Routing API chyba: %1").arg(error.isEmpty() ? QString::number(status) : error));
+        if (reply->error() != QNetworkReply::NoError || status >= 400 || !error.isEmpty()) {
+            setStatus(QStringLiteral("Odorik API chyba: %1").arg(error.isEmpty() ? QString::number(status) : error));
+            if (failure) failure();
+        }
         else callback(QJsonDocument::fromJson(body));
         reply->deleteLater();
     });
@@ -871,6 +997,116 @@ void AppController::deleteRecording(const QString &id, bool confirmed)
     QNetworkRequest request = bridgeRequest(QStringLiteral("v1/recordings/") + bridgeId); request.setRawHeader("X-Confirm-Delete", "recording");
     QNetworkReply *reply = network_.deleteResource(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply, removeRow] { if (reply->error() == QNetworkReply::NoError) removeRow(); else setStatus(QStringLiteral("Bridge nahrávku nelze smazat")); reply->deleteLater(); });
+}
+
+QVariantMap AppController::systemDiagnostics() const
+{
+    QStringList addresses;
+    for (const QHostAddress &address : QNetworkInterface::allAddresses())
+        if (!address.isLoopback() && !address.isLinkLocal()) addresses << address.toString();
+    addresses.removeDuplicates();
+    QString cipher;
+    QSqlQuery query(database_);
+    if (query.exec(QStringLiteral("PRAGMA cipher_version")) && query.next()) cipher = query.value(0).toString();
+    const QStorageInfo storage(database_.databaseName());
+    return {{QStringLiteral("app"), QCoreApplication::applicationName()}, {QStringLiteral("version"), QCoreApplication::applicationVersion()},
+            {QStringLiteral("qt"), QString::fromLatin1(qVersion())}, {QStringLiteral("os"), QSysInfo::prettyProductName()},
+            {QStringLiteral("kernel"), QSysInfo::kernelType() + QLatin1Char(' ') + QSysInfo::kernelVersion()},
+            {QStringLiteral("architecture"), QSysInfo::currentCpuArchitecture()}, {QStringLiteral("localAddresses"), addresses},
+            {QStringLiteral("sslSupported"), QSslSocket::supportsSsl()}, {QStringLiteral("sslBuild"), QSslSocket::sslLibraryBuildVersionString()},
+            {QStringLiteral("sslRuntime"), QSslSocket::sslLibraryVersionString()}, {QStringLiteral("databaseDriver"), database_.driverName()},
+            {QStringLiteral("sqlCipher"), cipher.isEmpty() ? QStringLiteral("not-active") : cipher},
+            {QStringLiteral("databaseFreeBytes"), storage.isValid() ? storage.bytesAvailable() : -1},
+            {QStringLiteral("apiConfigured"), !user_.isEmpty() && !password_.isEmpty()},
+            {QStringLiteral("bridgeConfigured"), bridgeBaseUrl_.isValid() && !bridgeToken_.isEmpty()},
+            {QStringLiteral("pjsipAvailable"), pjsipAvailable()}, {QStringLiteral("webEngineAvailable"), webEngineAvailable()}};
+}
+
+void AppController::runNetworkDiagnostics()
+{
+    networkDiagnostics_.clear();
+    networkDiagnostics_ << QVariantMap{{QStringLiteral("kind"), QStringLiteral("dns")}, {QStringLiteral("target"), QStringLiteral("sip.odorik.cz")}, {QStringLiteral("status"), QStringLiteral("running")}};
+    const QList<QPair<int, bool>> ports {{443,false},{5060,false},{6688,false},{6699,false},{5061,true},{6689,true}};
+    for (const auto &[port, tls] : ports)
+        networkDiagnostics_ << QVariantMap{{QStringLiteral("kind"), tls ? QStringLiteral("tls") : QStringLiteral("tcp")}, {QStringLiteral("target"), QStringLiteral("sip.odorik.cz:%1").arg(port)}, {QStringLiteral("port"), port}, {QStringLiteral("status"), QStringLiteral("running")}};
+    emit networkDiagnosticsChanged();
+    QHostInfo::lookupHost(QStringLiteral("sip.odorik.cz"), this, [this](const QHostInfo &host) {
+        QStringList addresses; for (const QHostAddress &address : host.addresses()) addresses << address.toString();
+        if (!networkDiagnostics_.isEmpty()) networkDiagnostics_[0] = QVariantMap{{QStringLiteral("kind"), QStringLiteral("dns")}, {QStringLiteral("target"), QStringLiteral("sip.odorik.cz")},
+            {QStringLiteral("status"), host.error() == QHostInfo::NoError ? QStringLiteral("ok") : QStringLiteral("failed")}, {QStringLiteral("detail"), host.error() == QHostInfo::NoError ? addresses.join(QStringLiteral(", ")) : host.errorString()}};
+        emit networkDiagnosticsChanged();
+    });
+    for (qsizetype index = 0; index < ports.size(); ++index) {
+        const int port = ports.at(index).first; const bool tls = ports.at(index).second; const qsizetype resultIndex = index + 1;
+        QAbstractSocket *socket = tls ? static_cast<QAbstractSocket *>(new QSslSocket(this)) : static_cast<QAbstractSocket *>(new QTcpSocket(this));
+        auto finish = [this, socket, resultIndex, port, tls](const QString &status, const QString &detail) {
+            if (socket->property("finished").toBool()) return;
+            socket->setProperty("finished", true);
+            networkDiagnostics_[resultIndex] = QVariantMap{{QStringLiteral("kind"), tls ? QStringLiteral("tls") : QStringLiteral("tcp")},
+                {QStringLiteral("target"), QStringLiteral("sip.odorik.cz:%1").arg(port)}, {QStringLiteral("port"), port},
+                {QStringLiteral("status"), status}, {QStringLiteral("detail"), detail}};
+            emit networkDiagnosticsChanged(); socket->deleteLater();
+        };
+        connect(socket, &QAbstractSocket::errorOccurred, this, [finish, socket](QAbstractSocket::SocketError) { finish(QStringLiteral("failed"), socket->errorString()); });
+        if (tls) {
+            auto *ssl = static_cast<QSslSocket *>(socket);
+            connect(ssl, &QSslSocket::encrypted, this, [finish, ssl] { finish(QStringLiteral("ok"), ssl->sessionCipher().name() + QStringLiteral(" · protocol %1").arg(int(ssl->sessionProtocol()))); });
+            ssl->connectToHostEncrypted(QStringLiteral("sip.odorik.cz"), quint16(port));
+        } else {
+            connect(socket, &QAbstractSocket::connected, this, [finish] { finish(QStringLiteral("ok"), QStringLiteral("TCP connected")); });
+            socket->connectToHost(QStringLiteral("sip.odorik.cz"), quint16(port));
+        }
+        QTimer::singleShot(4000, socket, [finish] { finish(QStringLiteral("timeout"), QString()); });
+    }
+}
+
+QUrl AppController::testToneUrl()
+{
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    QDir().mkpath(directory);
+    const QString path = directory + QStringLiteral("/test-tone.wav");
+    constexpr quint32 sampleRate = 44100, samples = sampleRate, dataSize = samples * 2;
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return {};
+    QDataStream out(&file); out.setByteOrder(QDataStream::LittleEndian);
+    out.writeRawData("RIFF",4); out << quint32(36 + dataSize); out.writeRawData("WAVEfmt ",8); out << quint32(16) << quint16(1) << quint16(1) << sampleRate << quint32(sampleRate * 2) << quint16(2) << quint16(16); out.writeRawData("data",4); out << dataSize;
+    for (quint32 i = 0; i < samples; ++i) out << qint16(std::sin(2.0 * std::numbers::pi * 440.0 * i / sampleRate) * 6000.0);
+    if (!file.commit()) return {};
+    return QUrl::fromLocalFile(path);
+}
+
+QVariant AppController::redactDiagnostics(const QVariant &value, const QString &key)
+{
+    const QString lower = key.toLower();
+    if (lower.contains(QLatin1String("password")) || lower.contains(QLatin1String("token")) || lower.contains(QLatin1String("secret")) || lower == QLatin1String("pin")) return QStringLiteral("[redacted]");
+    if (value.metaType().id() == QMetaType::QVariantMap) {
+        QVariantMap result; const QVariantMap source = value.toMap();
+        for (auto it = source.cbegin(); it != source.cend(); ++it) result.insert(it.key(), redactDiagnostics(it.value(), it.key()));
+        return result;
+    }
+    if (value.metaType().id() == QMetaType::QVariantList || value.metaType().id() == QMetaType::QStringList) {
+        QVariantList result; for (const QVariant &item : value.toList()) result << redactDiagnostics(item); return result;
+    }
+    if (value.metaType().id() != QMetaType::QString) return value;
+    QString text = value.toString();
+    text.replace(QRegularExpression(QStringLiteral("(?i)(sips?:)[^@\\s>]+@")), QStringLiteral("\\1[redacted]@"));
+    text.replace(QRegularExpression(QStringLiteral("\\b(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\.\\d{1,3}\\b")), QStringLiteral("\\1.x"));
+    if (QRegularExpression(QStringLiteral("^[0-9A-Fa-f:]+$")).match(text).hasMatch() && text.count(QLatin1Char(':')) >= 2) text = QStringLiteral("[ipv6-redacted]");
+    text.replace(QRegularExpression(QStringLiteral("(?<![A-Za-z])([0-9]{2})[0-9]{4,}(?![A-Za-z])")), QStringLiteral("\\1***"));
+    return text;
+}
+
+QString AppController::exportDiagnostics(const QVariantMap &telephony)
+{
+    const QVariantMap report{{QStringLiteral("createdAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
+                             {QStringLiteral("system"), systemDiagnostics()}, {QStringLiteral("network"), networkDiagnostics_},
+                             {QStringLiteral("telephony"), telephony}};
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/diagnostics");
+    QDir().mkpath(directory);
+    const QString path = directory + QStringLiteral("/thsip-%1.json").arg(QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss")));
+    QSaveFile file(path); const QByteArray data = QJsonDocument::fromVariant(redactDiagnostics(report)).toJson(QJsonDocument::Indented);
+    if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size() || !file.commit()) { setStatus(QStringLiteral("Diagnostický bundle nelze uložit")); return {}; }
+    setStatus(QStringLiteral("Redacted diagnostika exportována")); setOutput(path); return path;
 }
 
 QUrl AppController::portalUrl(const QString &page) const

@@ -47,6 +47,10 @@ Routing studio načítá typované veřejné linky, ringings a caller routes. Sk
 
 Nahrávky spojují lokální PJSUA2 WAV a Bridge uploady podle Call-ID. Bridge token je v Keychainu; přehrání používá Qt Multimedia, export atomický zápis, notes/retention se synchronizují a mazání vyžaduje potvrzení. Lokální soubor jde do Koše, Bridge smaže S3 objekt i DB řádek.
 
+Přehled načítá jen oficiální read-only API: kredit, denní/týdenní/měsíční statistiky, aktivní a zmeškané hovory, linky, SIM a měsíční náklady podle linek a destinací. `sip_password` z odpovědi se před předáním do QML odstraní.
+
+Diagnostika ukazuje PJSIP transporty/registrace/NAT události, média, zařízení, DNS a TCP/TLS porty 443/5060/6688/6699/5061/6689. Obsahuje test tónu, mikrofonní loopback, kameru a Odorik *080/*081/*0811. Export maskuje secrets, SIP identity, IP adresy a dlouhá čísla.
+
 Citlivé údaje nejsou v repo ani SQLite. macOS ukládá API heslo přímo do systémového Keychainu; Windows/Linux target zapojí QtKeychain. Aktuální lokální build používá Qt `QSQLITE`; produkční build gate musí dodat a reopen testem ověřit SQLCipher Qt driver. Samotná položka `sqlcipher` ve `vcpkg.json` šifrování Qt databáze nezapíná.
 
 ## Licence

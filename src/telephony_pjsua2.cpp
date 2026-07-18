@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QMetaObject>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <pjsua2.hpp>
 #include <pjsua-lib/pjsua.h>
@@ -67,9 +68,17 @@ public:
     TelephonyEngine::Private *owner;
 };
 
+class ThsipEndpoint final : public pj::Endpoint {
+public:
+    explicit ThsipEndpoint(TelephonyEngine::Private *owner) : owner(owner) {}
+    void onNatDetectionComplete(const pj::OnNatDetectionCompleteParam &param) override;
+    void onNatCheckStunServersComplete(const pj::OnNatCheckStunServersCompleteParam &param) override;
+    TelephonyEngine::Private *owner;
+};
+
 class TelephonyEngine::Private {
 public:
-    explicit Private(TelephonyEngine *q) : q(q)
+    explicit Private(TelephonyEngine *q) : q(q), endpoint(this)
     {
         endpoint.libCreate();
         pj::EpConfig config;
@@ -100,7 +109,7 @@ public:
     template<class Function> void protect(const QString &operation, Function function)
     {
         try { std::scoped_lock lock(mutex); endpoint.libRegisterThread("thsip-qt"); function(); }
-        catch (const pj::Error &e) { emit q->error(operation, QString::fromStdString(e.info())); }
+        catch (const pj::Error &e) { const QString message = QString::fromStdString(e.info()); recordEvent(QStringLiteral("error"), {{QStringLiteral("operation"), operation}, {QStringLiteral("message"), message}}); emit q->error(operation, message); }
     }
     ThsipCall *call(const QString &id)
     {
@@ -119,6 +128,7 @@ public:
         const pj::CallInfo info = call.getInfo();
         QVariantMap state{{"remoteUri", QString::fromStdString(info.remoteUri)}, {"state", QString::fromStdString(info.stateText)}, {"lastCode", info.lastStatusCode}, {"mediaCount", int(info.media.size())}};
         QMetaObject::invokeMethod(q, [q=q, id=call.publicId, state] { emit q->callState(id, state); }, Qt::QueuedConnection);
+        recordEvent(QStringLiteral("call"), {{QStringLiteral("id"), call.publicId}, {QStringLiteral("state"), state.value(QStringLiteral("state"))}, {QStringLiteral("code"), state.value(QStringLiteral("lastCode"))}});
     }
     void publish(ThsipBuddy &buddy, bool dialog)
     {
@@ -139,15 +149,36 @@ public:
         }
         QMetaObject::invokeMethod(q, [q=q, id=buddy.publicId, state] { emit q->buddyState(id, state); }, Qt::QueuedConnection);
     }
+    void recordEvent(const QString &kind, QVariantMap details)
+    {
+        std::scoped_lock lock(mutex);
+        details.insert(QStringLiteral("kind"), kind);
+        details.insert(QStringLiteral("at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+        diagnosticEvents.prepend(details);
+        if (diagnosticEvents.size() > 500) diagnosticEvents.resize(500);
+        QMetaObject::invokeMethod(q, [q=q, event=details] { emit q->diagnosticEvent(event); }, Qt::QueuedConnection);
+    }
     TelephonyEngine *q;
-    pj::Endpoint endpoint;
+    ThsipEndpoint endpoint;
     std::jthread worker;
     std::recursive_mutex mutex;
     std::unordered_map<std::string, std::unique_ptr<ThsipAccount>> accounts;
     std::unordered_map<std::string, std::unique_ptr<ThsipCall>> calls;
     std::unordered_map<std::string, std::unique_ptr<ThsipBuddy>> buddies;
     std::unordered_map<std::string, std::unique_ptr<pj::AudioMediaRecorder>> recorders;
+    QVariantList diagnosticEvents;
+    bool loopback = false;
 };
+
+void ThsipEndpoint::onNatDetectionComplete(const pj::OnNatDetectionCompleteParam &param)
+{
+    owner->recordEvent(QStringLiteral("nat"), {{QStringLiteral("ok"), param.status == PJ_SUCCESS}, {QStringLiteral("type"), QString::fromStdString(param.natTypeName)}, {QStringLiteral("reason"), QString::fromStdString(param.reason)}});
+}
+
+void ThsipEndpoint::onNatCheckStunServersComplete(const pj::OnNatCheckStunServersCompleteParam &param)
+{
+    owner->recordEvent(QStringLiteral("stun"), {{QStringLiteral("ok"), param.status == PJ_SUCCESS}, {QStringLiteral("server"), QString::fromStdString(param.name)}, {QStringLiteral("address"), QString::fromStdString(param.addr)}});
+}
 
 void ThsipCall::onCallState(pj::OnCallStateParam &)
 {
@@ -175,6 +206,7 @@ void ThsipAccount::onRegState(pj::OnRegStateParam &param)
 {
     const pj::AccountInfo info = getInfo();
     QMetaObject::invokeMethod(owner->q, [q=owner->q,id=publicId,active=info.regIsActive,reason=QString::fromStdString(param.reason)] { emit q->accountState(id, active, reason); }, Qt::QueuedConnection);
+    owner->recordEvent(QStringLiteral("registration"), {{QStringLiteral("account"), publicId}, {QStringLiteral("registered"), info.regIsActive}, {QStringLiteral("code"), int(info.regStatus)}, {QStringLiteral("reason"), QString::fromStdString(param.reason)}});
 }
 void ThsipAccount::onIncomingCall(pj::OnIncomingCallParam &param)
 {
@@ -465,4 +497,56 @@ QVariantList TelephonyEngine::mediaStatistics(const QString &id)
         }
     });
     return result;
+}
+
+QVariantMap TelephonyEngine::diagnostics()
+{
+    QVariantMap result;
+    if (!d) return {{QStringLiteral("available"), false}};
+    d->protect(QStringLiteral("diagnostics"), [&] {
+        const pj::Version version = d->endpoint.libVersion();
+        QVariantList transports;
+        for (const int id : d->endpoint.transportEnum()) {
+            const pj::TransportInfo info = d->endpoint.transportGetInfo(id);
+            transports << QVariantMap{{QStringLiteral("id"), id}, {QStringLiteral("type"), QString::fromStdString(info.typeName)},
+                                      {QStringLiteral("localAddress"), QString::fromStdString(info.localAddress)},
+                                      {QStringLiteral("publishedAddress"), QString::fromStdString(info.localName)},
+                                      {QStringLiteral("usage"), int(info.usageCount)}};
+        }
+        QVariantList accounts;
+        for (const auto &[id, account] : d->accounts) {
+            const pj::AccountInfo info = account->getInfo();
+            accounts << QVariantMap{{QStringLiteral("id"), QString::fromStdString(id)}, {QStringLiteral("uri"), QString::fromStdString(info.uri)},
+                                    {QStringLiteral("registered"), info.regIsActive}, {QStringLiteral("expires"), int(info.regExpiresSec)},
+                                    {QStringLiteral("status"), int(info.regStatus)}, {QStringLiteral("statusText"), QString::fromStdString(info.regStatusText)}};
+        }
+        QString nat = QStringLiteral("unknown/not-tested");
+        try { nat = QString::number(int(d->endpoint.natGetType())); } catch (const pj::Error &) {}
+        result = {{QStringLiteral("available"), true}, {QStringLiteral("pjsip"), QString::fromStdString(version.full)},
+                  {QStringLiteral("transports"), transports}, {QStringLiteral("accounts"), accounts},
+                  {QStringLiteral("calls"), int(d->calls.size())}, {QStringLiteral("buddies"), int(d->buddies.size())},
+                  {QStringLiteral("nat"), nat}, {QStringLiteral("events"), d->diagnosticEvents}};
+    });
+    return result;
+}
+
+void TelephonyEngine::detectNat(const QString &stunServer)
+{
+    if (!d || !QRegularExpression(QStringLiteral("^[A-Za-z0-9._-]+(?::[0-9]{1,5})?$" )).match(stunServer.trimmed()).hasMatch()) { emit error(QStringLiteral("detectNat"), QStringLiteral("invalid STUN server")); return; }
+    d->protect(QStringLiteral("detectNat"), [&] {
+        d->endpoint.natUpdateStunServers({stunServer.trimmed().toStdString()}, true);
+        d->endpoint.natDetectType();
+    });
+}
+
+void TelephonyEngine::setAudioLoopback(bool enabled)
+{
+    if (!d) return;
+    d->protect(QStringLiteral("audioLoopback"), [&] {
+        auto &capture = d->endpoint.audDevManager().getCaptureDevMedia();
+        auto &playback = d->endpoint.audDevManager().getPlaybackDevMedia();
+        enabled ? capture.startTransmit(playback) : capture.stopTransmit(playback);
+        d->loopback = enabled;
+        d->recordEvent(QStringLiteral("audio-loopback"), {{QStringLiteral("enabled"), enabled}});
+    });
 }

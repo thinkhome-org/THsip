@@ -43,6 +43,8 @@ class AppController final : public QObject {
     Q_PROPERTY(QVariantList routingRoutes READ routingRoutes NOTIFY routingChanged)
     Q_PROPERTY(QVariantList recordings READ recordings NOTIFY recordingsChanged)
     Q_PROPERTY(QUrl recordingPlaybackUrl READ recordingPlaybackUrl NOTIFY recordingPlaybackUrlChanged)
+    Q_PROPERTY(QVariantList networkDiagnostics READ networkDiagnostics NOTIFY networkDiagnosticsChanged)
+    Q_PROPERTY(QVariantMap dashboard READ dashboard NOTIFY dashboardChanged)
     Q_PROPERTY(bool webEngineAvailable READ webEngineAvailable CONSTANT)
     Q_PROPERTY(bool pjsipAvailable READ pjsipAvailable CONSTANT)
 
@@ -62,6 +64,8 @@ public:
     QVariantList routingRoutes() const { return routingRoutes_; }
     QVariantList recordings() const { return recordings_; }
     QUrl recordingPlaybackUrl() const { return recordingPlaybackUrl_; }
+    QVariantList networkDiagnostics() const { return networkDiagnostics_; }
+    QVariantMap dashboard() const { return dashboard_; }
     bool webEngineAvailable() const;
     bool pjsipAvailable() const;
 
@@ -76,6 +80,8 @@ public:
     Q_INVOKABLE void importContacts(const QUrl &file);
     Q_INVOKABLE void refreshContacts();
     Q_INVOKABLE void refreshBalance();
+    Q_INVOKABLE void refreshDashboard();
+    static QVariantMap summarizeStatistics(const QJsonObject &statistics);
     Q_INVOKABLE QString compileDial(const QString &destination, const QVariantList &modifiers) const;
     Q_INVOKABLE QString compileDialAction(const QString &id, const QVariantMap &parameters, bool advancedEnabled) const;
     Q_INVOKABLE QVariantMap routingPreview(const QString &publicNumber, const QString &mode, const QVariantList &targets, const QVariantMap &options) const;
@@ -91,6 +97,11 @@ public:
     Q_INVOKABLE void exportRecording(const QString &id, const QUrl &destination);
     Q_INVOKABLE void updateRecording(const QString &id, const QString &notes, const QString &retainUntil);
     Q_INVOKABLE void deleteRecording(const QString &id, bool confirmed);
+    Q_INVOKABLE QVariantMap systemDiagnostics() const;
+    Q_INVOKABLE void runNetworkDiagnostics();
+    Q_INVOKABLE QUrl testToneUrl();
+    Q_INVOKABLE QString exportDiagnostics(const QVariantMap &telephony);
+    static QVariant redactDiagnostics(const QVariant &value, const QString &key = {});
     void registerLocalRecording(const QString &callId, const QString &path);
     Q_INVOKABLE QUrl portalUrl(const QString &page) const;
     Q_INVOKABLE bool isOfficialPortalUrl(const QUrl &url) const;
@@ -105,6 +116,8 @@ signals:
     void routingChanged();
     void recordingsChanged();
     void recordingPlaybackUrlChanged();
+    void networkDiagnosticsChanged();
+    void dashboardChanged();
 
 private:
     void setStatus(QString value);
@@ -114,7 +127,9 @@ private:
     QUrl endpoint(const QString &path, const QVariantMap &query) const;
     QByteArray formBody(const QVariantMap &parameters) const;
     void handleReply(class QNetworkReply *reply, const QString &path, const QVariantMap &parameters, bool mutation);
-    void getJson(const QString &path, const QVariantMap &parameters, std::function<void(QJsonDocument)> callback);
+    void getJson(const QString &path, const QVariantMap &parameters, std::function<void(QJsonDocument)> callback,
+                 std::function<void()> failure = {});
+    void finishDashboardRequest(quint64 generation);
     bool knownRoutingNumber(const QString &number) const;
     void loadRecordings();
     void fetchRecording(const QString &id, std::function<void(QByteArray, QString)> callback);
@@ -132,6 +147,10 @@ private:
     QUrl recordingPlaybackUrl_;
     QUrl bridgeBaseUrl_;
     QString bridgeToken_;
+    QVariantList networkDiagnostics_;
+    QVariantMap dashboard_;
+    quint64 dashboardGeneration_ = 0;
+    int dashboardPending_ = 0;
     QSqlDatabase database_;
     QString user_;
     QString password_;

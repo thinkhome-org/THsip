@@ -76,6 +76,18 @@ private slots:
         QVERIFY(AppController::odorikError("42.50").isEmpty());
     }
 
+    void callStatisticsSummary()
+    {
+        const QVariantMap summary = AppController::summarizeStatistics(QJsonObject{
+            {QStringLiteral("incoming"), QJsonObject{{QStringLiteral("count"), 2}, {QStringLiteral("length"), 60}, {QStringLiteral("price"), 1.5}}},
+            {QStringLiteral("outgoing"), QJsonObject{{QStringLiteral("count"), 3}, {QStringLiteral("length"), 120}, {QStringLiteral("price"), 4.0}}},
+            {QStringLiteral("redirected"), QJsonObject{{QStringLiteral("count"), 1}, {QStringLiteral("length"), 30}, {QStringLiteral("price"), 0.5}}}
+        });
+        QCOMPARE(summary.value(QStringLiteral("count")).toLongLong(), 6);
+        QCOMPARE(summary.value(QStringLiteral("length")).toLongLong(), 210);
+        QCOMPARE(summary.value(QStringLiteral("price")).toDouble(), 6.0);
+    }
+
     void smsSegmentation()
     {
         AppController app;
@@ -169,6 +181,26 @@ private slots:
         QFile exported(exportPath);
         QVERIFY(exported.open(QIODevice::ReadOnly));
         QCOMPARE(exported.readAll(), QByteArrayLiteral("RIFFtest"));
+    }
+
+    void diagnosticsRedactionAndTone()
+    {
+        AppController app;
+        const QVariantMap redacted = AppController::redactDiagnostics(QVariantMap{
+            {QStringLiteral("password"), QStringLiteral("never-export")},
+            {QStringLiteral("uri"), QStringLiteral("sip:123456@sip.odorik.cz")},
+            {QStringLiteral("address"), QStringLiteral("192.168.10.42:5060")},
+            {QStringLiteral("number"), QStringLiteral("00420910123456")}
+        }).toMap();
+        QCOMPARE(redacted.value(QStringLiteral("password")).toString(), QStringLiteral("[redacted]"));
+        QVERIFY(!redacted.value(QStringLiteral("uri")).toString().contains(QStringLiteral("123456")));
+        QVERIFY(redacted.value(QStringLiteral("address")).toString().contains(QStringLiteral("192.168.10.x")));
+        QVERIFY(!redacted.value(QStringLiteral("number")).toString().contains(QStringLiteral("00420910123456")));
+        QFile tone(app.testToneUrl().toLocalFile());
+        QVERIFY(tone.open(QIODevice::ReadOnly));
+        QCOMPARE(tone.read(4), QByteArrayLiteral("RIFF"));
+        QVERIFY(tone.size() > 88000);
+        QVERIFY(app.systemDiagnostics().contains(QStringLiteral("sqlCipher")));
     }
 
     void portalWhitelist()
