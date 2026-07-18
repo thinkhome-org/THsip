@@ -198,6 +198,8 @@ ApplicationWindow {
         function onIncomingCall(callId, state) {
             root.currentCallId = callId
             root.currentCallState = "Příchozí: " + (state.remoteUri || "")
+            platform.showIncomingCall(state.remoteUri || "Neznámý volající")
+            platform.preventSleepDuringCall(true)
         }
         function onCallState(callId, state) {
             if (callId === root.currentCallId || callId === root.consultationCallId)
@@ -205,7 +207,9 @@ ApplicationWindow {
             if (state.state === "DISCONNECTED") {
                 if (callId === root.currentCallId) root.currentCallId = ""
                 if (callId === root.consultationCallId) root.consultationCallId = ""
+                if (!root.currentCallId && !root.consultationCallId) { platform.clearIncomingCall(); platform.preventSleepDuringCall(false) }
             }
+            if (state.state === "CONFIRMED") { platform.clearIncomingCall(); platform.preventSleepDuringCall(true) }
         }
         function onMessageReceived(accountId, from, contentType, message) {
             root.messageLog += (root.messageLog ? "\n" : "") + from + ": " + message
@@ -1143,6 +1147,7 @@ ApplicationWindow {
                     Label { text: "Kamery: " + root.videoDeviceList.map(device => device.name).join(", "); wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     Label { text: "Kodeky: " + root.codecList.filter(codec => codec.priority > 0).map(codec => codec.id + " (" + codec.priority + ")").join(", "); wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     Label { text: "macOS: heslo v systémovém Keychainu. Windows/Linux build použije QtKeychain adaptér."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                    Button { text: "Povolit notifikace, mikrofon a kameru"; onClicked: platform.requestPermissions() }
                     Label { text: "THsip Bridge"; font.pixelSize: 20; font.bold: true }
                     RowLayout {
                         TextField { id: bridgeUrl; placeholderText: "https://bridge.example.cz/"; Layout.fillWidth: true }

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install qt qtwebengine qtwebsockets libphonenumber
+      - run: cmake --preset macos-arm64-release
+      - run: cmake --build --preset release -j 3
+      - run: ctest --test-dir build/release --output-on-failure
+      - run: scripts/package-macos.sh build/release build/package
+
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+      - run: npm ci
+        working-directory: bridge
+      - run: npm run build
+        working-directory: bridge
+      - run: npm test
+        working-directory: bridge

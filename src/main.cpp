@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "platformintegration.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -22,8 +23,10 @@ int main(int argc, char *argv[])
     QGuiApplication::setApplicationName(QStringLiteral("THsip"));
 
     AppController controller;
+    PlatformIntegration platform;
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("backend"), &controller);
+    engine.rootContext()->setContextProperty(QStringLiteral("platform"), &platform);
 #ifdef THSIP_HAVE_PJSIP
     TelephonyEngine telephony;
     engine.rootContext()->setContextProperty(QStringLiteral("telephony"), &telephony);

@@ -10,6 +10,7 @@ option(THSIP_WITH_PJSIP "Enable PJSUA2 telephony" ON)
 option(THSIP_FETCH_PJSIP "Fetch pinned PJSIP when not installed" ON)
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Network Sql Multimedia Test WebSockets)
+find_package(Qt6 QUIET COMPONENTS Svg VirtualKeyboard VirtualKeyboardQml)
 find_package(unofficial-libphonenumber CONFIG QUIET)
 find_package(libphonenumber CONFIG QUIET)
 if(THSIP_WITH_WEBENGINE)
@@ -24,12 +25,13 @@ qt_add_executable(thsip
   src/backend.h
   src/secretstore.h
   src/contactstore.h
+  src/platformintegration.h
 )
 if(APPLE)
-  target_sources(thsip PRIVATE src/secretstore_macos.mm src/contactstore_macos.mm)
-  set_source_files_properties(src/contactstore_macos.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_sources(thsip PRIVATE src/secretstore_macos.mm src/contactstore_macos.mm src/platformintegration_macos.mm)
+  set_source_files_properties(src/contactstore_macos.mm src/platformintegration_macos.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 else()
-  target_sources(thsip PRIVATE src/secretstore_stub.cpp src/contactstore_stub.cpp)
+  target_sources(thsip PRIVATE src/secretstore_stub.cpp src/contactstore_stub.cpp src/platformintegration_stub.cpp)
 endif()
 
 qt_add_qml_module(thsip
@@ -45,6 +47,10 @@ target_link_libraries(thsip PRIVATE
   "$<$<PLATFORM_ID:Darwin>:-framework Security>"
   "$<$<PLATFORM_ID:Darwin>:-framework Foundation>"
   "$<$<PLATFORM_ID:Darwin>:-framework Contacts>"
+  "$<$<PLATFORM_ID:Darwin>:-framework AppKit>"
+  "$<$<PLATFORM_ID:Darwin>:-framework AVFoundation>"
+  "$<$<PLATFORM_ID:Darwin>:-framework IOKit>"
+  "$<$<PLATFORM_ID:Darwin>:-framework UserNotifications>"
 )
 
 if(TARGET unofficial::libphonenumber::libphonenumber)
@@ -78,6 +84,7 @@ if(THSIP_WITH_PJSIP)
       GIT_REPOSITORY https://github.com/pjsip/pjproject.git
       GIT_TAG 2.17
       GIT_SHALLOW TRUE
+      EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(pjproject)
     set(THSIP_PJSIP_TARGET pjsua2)
@@ -135,3 +142,21 @@ endif()
 add_test(NAME thsip_core COMMAND thsip_tests)
 
 install(TARGETS thsip BUNDLE DESTINATION . RUNTIME DESTINATION bin)
+set(THSIP_DEPLOY_TOOL_OPTIONS "")
+foreach(module_target IN ITEMS Qt6::Svg Qt6::VirtualKeyboard Qt6::VirtualKeyboardQml)
+  if(TARGET ${module_target})
+    get_target_property(module_location ${module_target} IMPORTED_LOCATION_RELEASE)
+    get_filename_component(module_location "${module_location}" REALPATH)
+    get_filename_component(module_lib_dir "${module_location}/../../../.." ABSOLUTE)
+    list(APPEND THSIP_DEPLOY_TOOL_OPTIONS "-libpath=${module_lib_dir}")
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES THSIP_DEPLOY_TOOL_OPTIONS)
+qt_generate_deploy_app_script(
+  TARGET thsip
+  OUTPUT_SCRIPT thsip_deploy_script
+  NO_UNSUPPORTED_PLATFORM_ERROR
+  EXCLUDE_PLUGINS QSvgPlugin QSvgIconPlugin QVirtualKeyboardPlugin
+  DEPLOY_TOOL_OPTIONS ${THSIP_DEPLOY_TOOL_OPTIONS}
+)
+install(SCRIPT ${thsip_deploy_script})
