@@ -84,7 +84,7 @@ public:
     {
         std::promise<void> ready;
         auto initialized = ready.get_future();
-        worker = std::jthread([this, &ready](std::stop_token stop) {
+        worker = std::thread([this, &ready] {
             try {
                 endpoint.libCreate();
                 pj::EpConfig config;
@@ -104,7 +104,7 @@ public:
                 ready.set_exception(std::current_exception());
                 return;
             }
-            while (!stop.stop_requested()) {
+            while (!stopping.load()) {
                 std::deque<std::function<void()>> pending;
                 { std::scoped_lock lock(commandMutex); pending.swap(commands); }
                 for (auto &command : pending) command();
@@ -118,7 +118,7 @@ public:
     }
     ~Private()
     {
-        worker.request_stop();
+        stopping.store(true);
         worker.join();
     }
     template<class Function> void protect(const QString &operation, Function function)
@@ -190,7 +190,8 @@ public:
     }
     TelephonyEngine *q;
     ThsipEndpoint endpoint;
-    std::jthread worker;
+    std::atomic_bool stopping{false};
+    std::thread worker;
     std::mutex commandMutex;
     std::deque<std::function<void()>> commands;
     std::recursive_mutex mutex;
