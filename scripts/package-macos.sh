@@ -38,6 +38,7 @@ self_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/thsip-sqlcipher.XXXXXX")
 sqlite3 "$self_test_dir/thsip.sqlite" 'CREATE TABLE migration_probe(value TEXT); INSERT INTO migration_probe VALUES ("ok");'
 THSIP_DATABASE_TEST_KEY=0000000000000000000000000000000000000000000000000000000000000000 THSIP_DATA_DIR="$self_test_dir" "$app/Contents/MacOS/thsip" --database-migration-self-test
 THSIP_DATABASE_TEST_KEY=0000000000000000000000000000000000000000000000000000000000000000 THSIP_DATA_DIR="$self_test_dir" "$app/Contents/MacOS/thsip" --telephony-self-test
+THSIP_DATABASE_TEST_KEY=0000000000000000000000000000000000000000000000000000000000000000 THSIP_DATA_DIR="$self_test_dir" "$app/Contents/MacOS/thsip" --qml-self-test
 
 cmake -E rm -f "$archive"
 ditto -c -k --keepParent "$app" "$archive"

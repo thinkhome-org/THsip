@@ -76,5 +76,7 @@ int main(int argc, char *argv[])
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,
                      [] { QCoreApplication::exit(1); }, Qt::QueuedConnection);
     engine.loadFromModule(QStringLiteral("THsip"), QStringLiteral("Main"));
+    if (app.arguments().contains(QStringLiteral("--qml-self-test")))
+        return engine.rootObjects().isEmpty() ? 7 : 0;
     return app.exec();
 }
