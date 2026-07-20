@@ -14,7 +14,7 @@ option(THSIP_FETCH_PJSIP "Fetch pinned PJSIP when not installed" ON)
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Network Sql Multimedia Test WebSockets)
 find_package(Qt6 QUIET COMPONENTS Svg VirtualKeyboard VirtualKeyboardQml)
-find_package(Boost QUIET COMPONENTS date_time)
+find_package(Boost QUIET COMPONENTS date_time thread)
 find_package(unofficial-libphonenumber CONFIG QUIET)
 find_package(libphonenumber CONFIG QUIET)
 if(THSIP_WITH_WEBENGINE)
