@@ -4,7 +4,9 @@ set -eu
 build_dir=${1:-build/release}
 package_dir=${2:-build/package}
 app="$package_dir/thsip.app"
+archive="$package_dir/THsip.zip"
 
+cmake -E rm -rf "$app"
 cmake --install "$build_dir" --prefix "$package_dir"
 test -d "$app"
 
@@ -37,7 +39,7 @@ sqlite3 "$self_test_dir/thsip.sqlite" 'CREATE TABLE migration_probe(value TEXT);
 THSIP_DATABASE_TEST_KEY=0000000000000000000000000000000000000000000000000000000000000000 THSIP_DATA_DIR="$self_test_dir" "$app/Contents/MacOS/thsip" --database-migration-self-test
 THSIP_DATABASE_TEST_KEY=0000000000000000000000000000000000000000000000000000000000000000 THSIP_DATA_DIR="$self_test_dir" "$app/Contents/MacOS/thsip" --telephony-self-test
 
-archive="$package_dir/THsip.zip"
+cmake -E rm -f "$archive"
 ditto -c -k --keepParent "$app" "$archive"
 
 if [ -n "${THSIP_NOTARY_PROFILE:-}" ]; then

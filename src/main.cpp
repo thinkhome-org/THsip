@@ -6,6 +6,7 @@
 #include <QSqlQuery>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QTimer>
 
 #ifdef THSIP_HAVE_PJSIP
 #include "telephony_pjsua2.h"
@@ -37,6 +38,25 @@ int main(int argc, char *argv[])
     }
     PlatformIntegration platform;
 #ifdef THSIP_HAVE_PJSIP
+    if (app.arguments().contains(QStringLiteral("--sip-registration-self-test"))) {
+        const QString user = qEnvironmentVariable("THSIP_SIP_USER");
+        const QString password = qEnvironmentVariable("THSIP_SIP_PASSWORD");
+        if (user.isEmpty() || password.isEmpty()) return 4;
+        TelephonyEngine telephony;
+        if (!telephony.diagnostics().value(QStringLiteral("available")).toBool()) return 3;
+        QObject::connect(&telephony, &TelephonyEngine::accountState, &app,
+                         [&app](const QString &, bool registered, const QString &) { if (registered) app.exit(0); });
+        QObject::connect(&telephony, &TelephonyEngine::error, &app,
+                         [&app](const QString &, const QString &) { app.exit(5); });
+        QTimer::singleShot(20000, &app, [&app] { app.exit(6); });
+        telephony.addAccount({
+            {QStringLiteral("idUri"), QStringLiteral("<sip:%1@sip.odorik.cz>").arg(user)},
+            {QStringLiteral("registrar"), QStringLiteral("sips:sip.odorik.cz:5061;transport=tls")},
+            {QStringLiteral("user"), user}, {QStringLiteral("password"), password},
+            {QStringLiteral("srtp"), true}, {QStringLiteral("ice"), true}
+        });
+        return app.exec();
+    }
     if (app.arguments().contains(QStringLiteral("--telephony-self-test"))) {
         TelephonyEngine telephony;
         return telephony.diagnostics().value(QStringLiteral("available")).toBool() ? 0 : 3;
